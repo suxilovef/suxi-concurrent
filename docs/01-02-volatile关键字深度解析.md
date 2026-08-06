@@ -2,6 +2,7 @@
 
 > **阶段一·第 2 篇** | 前置：[01-01-JMM内存模型与三大特性](./01-01-JMM内存模型与三大特性.md) | 后续：[01-03-CAS原理与Unsafe入门](./01-03-CAS原理与Unsafe入门.md)  
 > **建议时长**：4~5 小时（原理 1.5h + 源码分析 1h + 动手练习 1.5h）  
+> **源码口径**：JDK 17
 > 🛠️ **日常高频**：状态标志位、DCL 单例，几乎每个项目都会用到
 
 ---
@@ -49,43 +50,46 @@ shutdown = true;                   while (!shutdown) {
 ### 2.1 写 volatile 的语义
 
 ```
-当线程 A 写一个 volatile 变量时，JMM 会：
+当线程 A 写一个 volatile 变量时，这次写具有 release 语义：
 ┌─────────────────────────────────────────┐
-│  在 volatile 写之前，线程 A 工作内存中     │
-│  所有被修改过的共享变量（不一定 volatile）  │
-│  → 全部刷新到主内存                       │
+│  volatile 写之前的普通写                 │
+│  不能被重排序到 volatile 写之后            │
 │                                          │
-│  效果：写 volatile = 顺便把所有"脏数据"    │
-│        也一起写回主内存                    │
+│  其他线程一旦读到这次 volatile 写          │
+│  就能通过 happens-before 看到前面的普通写  │
+│                                          │
+│  效果：写 volatile = 发布前面已完成的修改   │
 └─────────────────────────────────────────┘
 ```
 
 ```java
-// volatile 写不仅保证 volatile 变量本身写回主内存，
-// 还保证写之前修改的普通变量也写回主内存
+// volatile 写不仅发布 volatile 变量本身，
+// 还通过 happens-before 发布它之前的普通写
 int a = 1;              // ① 普通写
 volatileFlag = true;    // ② volatile 写
-// ② 执行后，a 和 volatileFlag 的最新值都在主内存中对其他线程可见
+// 如果其他线程读到 volatileFlag=true，就一定能看到 ① 的结果
 ```
 
 ### 2.2 读 volatile 的语义
 
 ```
-当线程 B 读一个 volatile 变量时，JMM 会：
+当线程 B 读一个 volatile 变量时，这次读具有 acquire 语义：
 ┌─────────────────────────────────────────┐
-│  将线程 B 的工作内存置为无效               │
-│  → 强制从主内存重新读取所有共享变量        │
+│  volatile 读之后的普通读写                │
+│  不能被重排序到 volatile 读之前            │
 │                                          │
-│  效果：读 volatile = 顺便把工作内存"刷新"  │
-│        一次，后续读取都从主内存拿           │
+│  如果读到的是某次 volatile 写的值          │
+│  就能看到那次 volatile 写之前发布的修改     │
+│                                          │
+│  效果：读 volatile = 获取发布方的修改       │
 └─────────────────────────────────────────┘
 ```
 
 ```java
 // volatile 读不仅保证读到 volatile 变量的最新值，
-// 还能保证读到 volatile 读之后访问的普通变量的最新值
-if (volatileFlag) {     // ③ volatile 读 → 强制刷新工作内存
-    int b = a;          // ④ a 一定读到主内存中最新的 a = 1
+// 还会获取该 volatile 写之前发布的普通变量修改
+if (volatileFlag) {     // ③ volatile 读
+    int b = a;          // ④ 如果 ③ 读到 ② 的 true，a 一定是 1
 }
 ```
 
@@ -141,8 +145,8 @@ volatile 写：
 
 volatile 读：
     前序操作
-    ────── [LoadLoad 屏障]  ──────  禁止 volatile 读与下面的普通读重排
     volatile 读
+    ────── [LoadLoad 屏障]  ──────  禁止 volatile 读与下面的普通读重排
     ────── [LoadStore 屏障] ──────  禁止 volatile 读与下面的普通写重排
     后续操作
 ```
@@ -170,15 +174,16 @@ volatile 读后：LoadLoad + LoadStore
 ```
 x86 上：
   volatile 读 = 普通读（x86 读本身有序）
-  volatile 写 = 普通写 + lock 前缀指令（相当于 StoreLoad 屏障）
+  volatile 写 = 普通写 + StoreLoad 屏障效果
+  HotSpot 常见做法：在 volatile 写之后使用带 lock 前缀的指令充当屏障
 
 lock 前缀做了什么：
-  - 锁定总线/缓存行，保证写操作的独占
+  - 锁定缓存行相关操作（现代 CPU 通常不直接锁总线）
   - 使其他 CPU 缓存行失效（相当于 MESI → Invalidate）
   - 禁止 Store-Load 重排序
 ```
 
-> 你可以用 JITWatch + hsdis 插件观察有/无 volatile 时生成的实际汇编指令。无 volatile 时是普通 `mov` 指令，有 volatile 时前面有 `lock` 前缀。
+> 你可以用 JITWatch + hsdis 插件观察有/无 volatile 时生成的实际汇编指令。无 volatile 时通常是普通 `mov` 指令，有 volatile 时 HotSpot 可能在写之后生成带 `lock` 前缀的屏障指令。具体形式与 JDK 版本、CPU 架构、JIT 编译阶段有关。
 
 ---
 
@@ -431,7 +436,7 @@ public class ImmutableConfig {
 |---|---|---|
 | `Thread` | `volatile String name` | 线程名修改后对其他线程可见 |
 | `Thread` | `volatile int threadStatus` | 线程状态（6 种） |
-| `ThreadPoolExecutor` | `volatile int runState`（在 ctl 中） | 运行状态 + 线程数 |
+| `ThreadPoolExecutor` | `AtomicInteger ctl` | 高位保存运行状态，低位保存线程数；内部依赖 volatile value + CAS |
 | `AbstractQueuedSynchronizer` | `volatile int state` | 同步状态位 |
 | `ConcurrentHashMap` | `volatile Node<K,V>[] table` | 桶数组的引用 |
 | `FutureTask` | `volatile int state` | 任务状态 |
@@ -505,7 +510,7 @@ private static Singleton instance;  // 没有 volatile
    → 保证可见性和有序性（禁止重排），不保证原子性。i++ 是经典反例。
 
 2. **写 volatile 变量时，JMM 具体做了什么？**
-   → volatile 写之前的所有修改一起刷新到主内存。这是 **"附带刷新"** 效果。
+   → volatile 写具有 release 语义：写之前的普通写不能重排到 volatile 写之后；其他线程读到这次 volatile 写后，可以通过 happens-before 看到这些普通写。
 
 3. **DCL 单例中 volatile 的作用是什么？**
    → 禁止 `new` 操作中的分配内存和初始化重排序，防止其他线程拿到半初始化对象。
@@ -576,7 +581,7 @@ public class VolatilePracticeTest {
 }
 ```
 
-### 练习 2：volatile 写"附带刷新"验证（30 分钟）
+### 练习 2：volatile 写的发布语义验证（30 分钟）
 
 ```java
 package com.sw.yang.concurrent.jmm;
@@ -584,7 +589,7 @@ package com.sw.yang.concurrent.jmm;
 import org.junit.jupiter.api.Test;
 
 /**
- * 练习 2：验证 volatile 写的"附带刷新"效果
+ * 练习 2：验证 volatile 写的发布语义
  *
  * 线程 A：先写普通变量 → 再写 volatile 变量
  * 线程 B：先读 volatile 变量 → 再读普通变量
@@ -602,13 +607,13 @@ public class VolatilePropagationTest {
                 Thread.sleep(100); // 确保 reader 先开始等待
             } catch (InterruptedException e) { /* ignore */ }
             normalValue = 42;    // ① 先写普通变量
-            signal = true;       // ② 再写 volatile → 附带刷新 normalValue 到主内存
+            signal = true;       // ② 再写 volatile → 发布前面的普通写
             System.out.println("Writer: normalValue=" + normalValue + ", signal=true");
         }, "writer");
 
         Thread reader = new Thread(() -> {
             int attempts = 0;
-            while (!signal) {   // ③ 读 volatile → 附带刷新工作内存
+            while (!signal) {   // ③ 读 volatile → 获取 writer 发布的修改
                 attempts++;
             }
             // ④ 由于 ① hb ② hb ③ hb ④ → normalValue 一定为 42
@@ -616,7 +621,7 @@ public class VolatilePropagationTest {
             System.out.println("Reader: signal=true, normalValue=" + value +
                     " (attempts=" + attempts + ")");
             if (value == 42) {
-                System.out.println("✅ volatile 附带刷新生效");
+                System.out.println("✅ volatile 发布语义生效");
             } else {
                 System.out.println("❌ 不应该出现在这里");
             }
@@ -691,8 +696,8 @@ if (flag) {      // volatile 读 — 画出前后各插入什么屏障？
    volatile 是**无锁**的：
    - 不涉及线程上下文切换（没有内核态切换）
    - 不涉及阻塞/唤醒（无 wait/park 开销）
-   - 仅仅是一个 CPU 缓存刷新操作（x86 上 `lock` 前缀指令）
-   - 开销 ≈ 一个 CPU 周期级别的内存屏障
+   - 主要成本是内存屏障、缓存一致性通信和可能的缓存行失效
+   - 在低竞争场景下通常比阻塞锁轻，但不是"一个 CPU 周期"级别
 
    synchronized 有锁升级过程，最坏情况下需要：
    - 线程挂起 → 内核态 → 上下文切换 → 线程恢复
