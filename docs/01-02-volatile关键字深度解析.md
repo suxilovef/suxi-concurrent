@@ -62,6 +62,8 @@ shutdown = true;                   while (!shutdown) {
 └─────────────────────────────────────────┘
 ```
 
+> 💡 **一句话版**：写 volatile = 按下"发布"按钮，把前面干完的活（普通写）一次性发布出去；其他线程读到这次写 = 按下"接收"按钮，把发布的内容全部收进来。**完整因果链（为什么这句话成立）见 2.4。**
+
 ```java
 // volatile 写不仅发布 volatile 变量本身，
 // 还通过 happens-before 发布它之前的普通写
@@ -112,6 +114,98 @@ flag = true;           // ② volatile 写    int local = sharedVar; // ④
 
 > ⚠️ **关键限制**：上述推导只有在**单线程顺序写 → volatile 写**时才成立。如果 A 线程先写 `flag` 再写 `sharedVar`，B 线程不一定能看到 `sharedVar` 的修改。
 
+### 2.4 完整因果链：一条链讲透 volatile 可见性
+
+> 2.1/2.2 是"结论"，2.3 是"推导"。如果还是觉得跳，把下面这条因果链从硬件到效果完整走一遍——每一环都回答一个"为什么"。全链 5 环，环环相扣，没有缺口。
+
+**第 1 环：问题从哪来（为什么必须有这套规矩）**
+
+- 多核 CPU，每个核有自己的缓存（L1/L2），线程 A 跑在核 1、B 跑在核 2
+- A 的写可能还躺在自己的缓存/写缓冲里，没刷到共享内存；B 读的是自己那份缓存，可能是旧的
+- CPU 为了效率会乱序执行（把无关指令对调），编译器也会调序
+- 结果：没有规则时，B 可能看到——**旧值、半成品、乱序值**
+
+所以必须有一份规范，把"谁先谁后、谁看得见谁"的行为**钉死**。这就是 JMM（Java 内存模型，JLS §17.4）。
+
+**第 2 环：JMM 的答案（happens-before 规则）**
+
+> 若 A happens-before B，则 A 的结果对 B 可见，且 A 不会被重排到 B 之后。
+
+哪些情况算 happens-before（就 5 种，别的都不算）：
+
+| 规则 | 条件 |
+|---|---|
+| 程序顺序 | 同一线程内，按代码顺序 |
+| volatile | 对同一 volatile 变量，写 → 后来的读 |
+| 锁 | unlock → 之后同一个锁的 lock |
+| 线程 | start() → 新线程内一切；线程内一切 → join() 返回 |
+| 传递性 | A→B 且 B→C ⇒ A→C |
+
+**为什么用"规则"而不是"要求硬件别乱"？** 缓存、乱序是物理现实，规范只能规定**行为效果**，实现交给 JVM 各显神通（这就是第 4 环"不同 CPU 插不同屏障"的原因）。
+
+**第 3 环：volatile 的定义（2.1/2.2 那句话的真身）**
+
+JMM 给 volatile 定的条款：对 volatile 变量 v，**写 v happens-before 之后任意线程对 v 的读**。翻译成动作约束：
+
+- **volatile 写 = release**：写之前的所有普通写，不许被挪到写之后 → "发布"
+- **volatile 读 = acquire**：读之后的所有普通读写，不许被挪到读之前 → "收获"
+
+> ⚠️ 注意：这是**定义**，不是实现。2.1 里"volatile 写之前的普通写不能被重排序到 volatile 写之后"这句话**本身就是 volatile 的语义内容**，不是"为了实现可见性而附加的限制"——禁止跨边界 = 语义 = 同一件事。
+
+**第 4 环：JVM 落实（重排序有两处，屏障管两处）**
+
+重排序发生在两个地方，得两头堵：
+
+1. **编译时**（JIT 编译器换序）→ 靠编译期屏障标记拦
+2. **运行时**（CPU 乱序执行）→ 靠硬件屏障指令拦
+
+JVM 按 JSR-133 cookbook 的标准插屏障表（详见 3.2）：
+
+| 位置 | 插什么 | 管什么 |
+|---|---|---|
+| volatile 写**前** | StoreStore | 前面的普通写不许越过写跑后面 |
+| volatile 写**后** | StoreLoad | 后面的读不许越过写跑前面 |
+| volatile 读**后** | LoadLoad + LoadStore | 后面的读写不许越过读跑前面 |
+
+屏障是 CPU 的一条特殊指令（如 `mfence`/`dmb`），作用：① 前后指令不许跨越；② 强制把写缓冲冲刷出去、让写传播给其他核（配合缓存一致性协议）。
+
+> 同一规定，不同 CPU 执法力度不同：x86 本身序强（TSO），volatile 写 = 普通写 + `lock` 前缀指令，读甚至不用插屏障；ARM 弱序，屏障插得多。JMM 承诺的效果一样，手段不同。
+
+**第 5 环：闭环（为什么 B 最终一定看到完整数据）**
+
+```java
+// 线程 A
+x = 1;                  // ① 普通写
+// ── JVM 插入 StoreStore 屏障 ──
+ready = true;           // ② volatile 写 = 发布 + 冲刷缓存
+// ── JVM 插入 StoreLoad 屏障 ──
+
+// 线程 B
+if (ready) {            // ③ volatile 读 = 收获
+    // ── JVM 插入 LoadLoad + LoadStore 屏障 ──
+    use(x);             // ④ 普通读
+}
+```
+
+推理走一遍：
+
+1. **顺序保证**（第 4 环的屏障）：① 一定在 ② 之前完成 → **发布时 x 一定写完了**；③ 一定在 ④ 之前完成 → **没收到发布就绝不碰 x**
+2. **可见性保证**（第 4 环的冲刷）：② 执行时 A 的写传播出去；③ 读到的 `ready=true` 一定是 ② 写的那次 → **发布被接收了**
+3. **关系保证**（第 2 环的规则）：①→②（程序顺序）、②→③（volatile 条款）、③→④（程序顺序）、①→④（传递性）→ **JMM 承诺 x 对 B 完整可见**
+
+三股力量各管一段，没有缺口。
+
+**对照表：本节 ↔ 2.1 原文**
+
+| 2.1 原文那句话 | 对应环节 |
+|---|---|
+| "volatile 写之前的普通写不能被重排序到写之后" | 第 3 环（定义）+ 第 4 环（落实） |
+| "其他线程一旦读到这次 volatile 写" | 第 5 环的 ③ |
+| "就能通过 happens-before 看到前面的普通写" | 第 2 环规则 + 第 5 环传递性 |
+| "效果：写 volatile = 发布前面的修改" | 整个链条的结论 |
+
+> 📌 2.1 的原文 = 第 3 环 + 第 2 环 + 第 5 环的**压缩包**；第 1、4 环（硬件背景和屏障实现）原文默认读者已知、没写。刚接触时觉得不清晰是正常的——按本节链条从头读一遍即可。
+
 ---
 
 ## 3. volatile 禁止指令重排序
@@ -130,6 +224,56 @@ instance = memory;        // 3. 先赋值引用（instance 非 null！）
 ctor(memory);             // 2. 后初始化对象
 → 另一个线程看到 instance != null → 拿到半初始化对象 → 崩溃
 ```
+
+**重排后的完整效果走一遍（为什么半初始化对象会崩）：**
+
+**第 1 步：第 1 行一结束，`instance` 就非 null 了**
+
+内存地址已经拿到，重排只是把"初始化"挪到"赋值"之后：
+
+```
+线程 A 执行 new Singleton()：
+  memory = allocate();    // 1. 分配内存 —— 拿到一块地址（非 null）
+  instance = memory;      // 3. 先赋值引用 ← 重排到这里了！
+  ctor(memory);           // 2. 后初始化对象
+```
+
+**第 2 步：线程 B 在锁外就能拿到半成品**
+
+```java
+public static Singleton getInstance() {
+    if (instance == null) {          // ① 第一次检查（无锁快速路径）
+        synchronized (Singleton.class) {
+            if (instance == null) {
+                instance = new Singleton();  // ③
+            }
+        }
+    }
+    return instance;                 // ← B 在这里直接拿走
+}
+```
+
+时间线：
+
+```
+线程 A:  分配内存 → 赋值引用（instance 非 null！）
+                        ↑
+线程 B:  ① 检查：instance != null → 不进锁 → return instance
+                        ↑ 此时 A 的 ②（初始化）还没执行！
+```
+
+**第 3 步：半成品对象长什么样**
+
+内存分好了（引用非 null），但字段还是默认值（null / 0），构造方法里的逻辑一行都没跑：
+
+```java
+instance.cache.add("x");   // 💥 NPE —— cache 还是 null
+instance.getName();        // 💥 返回 null，逻辑错乱
+```
+
+> 🏠 **类比**：交房（分配内存）→ 装修（初始化）→ 挂牌出售（赋值引用）。重排成"交房 → 挂牌出售 → 装修"：B 看到"出售中"就拎包入住，结果墙是毛坯、水管没接——房子（引用）是真的，但住不了（字段全废）。
+
+> ⚠️ **为什么 synchronized 救不了 DCL？** 因为 B 的**第一次检查在锁外面**——看到非 null 就直接 return，根本不会进临界区。synchronized 只保护临界区内部，管不了这个无锁快速路径。只有 volatile 能保证"B 在锁外看到非 null 引用"这个时刻对象已初始化完（StoreStore 屏障：② 必须完成，③ 才允许发生，见 2.4 第 4 环）。所以 volatile 不是替代 synchronized，而是**补它管不到的那段缝隙**。
 
 ### 3.2 volatile 的屏障插入策略
 
@@ -213,6 +357,20 @@ count++ 被拆成三步：
             但不保证"读-加-写"这个整体不被打断
 ```
 
+> 🔍 **关键细节：加 1 这一步既不读也不写，它是纯计算**
+>
+> `iadd` 只是 CPU 在**寄存器**里做算术，全程不碰内存：
+>
+> ```
+> getstatic → 读：内存 → 寄存器
+> iadd      → 算：寄存器内 +1（内存不参与）
+> putstatic → 写：寄存器 → 内存
+> ```
+>
+> 所以"加 1"永远不会算错——错的是它**基于"读的那一刻"的值**。从读到写之间的缝隙里，内存的值可能已经被别的线程改过，而你的计算完全不知道，最后写回时把别人的结果覆盖掉——这就是"丢失更新"的本质。
+>
+> 这也解释了 `AtomicInteger` 的解决思路：要么用 CPU 单条"读-算-写"合并指令（`lock xadd`），要么用 CAS 发现值变了就重来——本质都是**把三步之间的缝隙焊死**（见 4.3）。
+
 ### 4.2 什么操作 volatile 能保证原子性
 
 ```java
@@ -254,6 +412,37 @@ void setBoth(int a, int b) {
 ---
 
 ## 5. volatile 的适用场景（🛠️ 日常高频）
+
+### 5.0 适用判据：四问体检法（判据从哪来）
+
+> 下面 5 个场景不是靠背的，是靠一套"四问体检法"筛出来的。判据也不是拍脑袋定的——它是拿 volatile 的能力清单**倒推**出来的：场景需要的能力，volatile 必须给得起；volatile 的短板，场景必须用不到。
+
+**volatile 的能力清单（来自 2.4 链条）：**
+
+| 能力 | volatile | 代价/短板 |
+|---|---|---|
+| 可见性（发布/接收） | ✅ | — |
+| 有序性（release/acquire） | ✅ | — |
+| 原子性（复合操作） | ❌ | 没有锁 |
+| 互斥（把别人挡在外面） | ❌ | 不阻塞 |
+| 读写开销 | 读几乎免费 | **写比较贵**（冲刷缓存 / `lock` 前缀） |
+
+**四问判据 ↔ 能力清单的对应关系：**
+
+| 判据 | 对应能力/短板 | 违反了会怎样 |
+|---|---|---|
+| ① 一个线程写，其他线程读 | volatile 只能"发布+接收"，**协调不了多个写者** | 两个线程同时写 → 互相覆盖 → 需要原子性 |
+| ② 单次读/单次写，无复合操作 | **没有原子性**，管不了读-改-写 | `count++` → 丢失更新（见 4.1 的缝隙） |
+| ③ 不需要互斥 | **没有锁**，无法围成临界区 | 需要"检查-修改"一体 → 拦不住别人插队 |
+| ④ 读多写少 | **写贵读便宜**，让贵的动作少发生 | 高频写 → 每次缓存失效，性能差 |
+
+**四问体检法（遇到新场景先过一遍）：**
+
+> ① 是单写多读吗？② 只是单次读写吗？③ 不需要互斥吗？④ 读多写少吗？
+>
+> **四问全过 → volatile 刚刚好；任一不过 → 升级工具。**
+
+判据反过来用就是升级路线：多个写者 → `AtomicInteger`；复合操作 → 锁或 CAS；需要临界区 → `synchronized` / `Lock`；高频写 → 状态复杂，通常也不是简单标志位。一旦需要任何一个，volatile 就只配当配角（如 `AtomicInteger` 内部的 `value` 字段）。
 
 ### 场景 1：状态标志位（Shutdown Flag）
 
@@ -364,6 +553,78 @@ public class ConfigManager {
 ```
 
 > ⚠️ **坑**：如果多个配置变量需要"同时生效"，应该包装成一个不可变对象，然后 volatile 引用那个对象。
+
+> 🎯 **统一原则（和坑 2 是同一件事）**：volatile 只保护**引用本身**，不保护引用指向的内容。"合并成一个对象"能生效，前提是配套写法——**整体替换引用**，而不是修改对象内部：
+>
+> | 写法 | 动作性质 | volatile 管吗 |
+> |---|---|---|
+> | `config = new AppConfig(...)` | 整体替换引用 | ✅ 管 |
+> | `config.setMaxConnections(200)` | 修改对象内部 | ❌ 不管（和坑 2 的 `arr[0] = 42` 一样） |
+>
+> 为什么"整体替换"后内容可见？因为对象内部字段的填充发生在 volatile 写**之前**（StoreStore 屏障保证），发布时一起带过去（见 2.4 第 4 环）：
+>
+> ```
+> new AppConfig(...) 里的所有写（内部字段填充）
+>      ↓ 在 volatile 写之前完成
+> config = 新对象    ← 一次 volatile 写，整体发布
+>      ↓
+> 业务线程读到新 config → 内部字段全部可见
+> ```
+>
+> 反过来说：如果写成 `config.setXxx(...)`（发布之后又改内部），没有新的发布动作，其他线程就停在旧状态——这和坑 2 的 `arr[0] = 42` 是完全一样的错误。**数组和对象一视同仁：volatile 管"换哪个对象"，不管"对象里面怎么动"。**
+
+**真实使用场景（都是"单写多读 + 读多写少"，四问全过）：**
+
+| 场景 | 具体长什么样 |
+|---|---|
+| 功能开关/灰度 | 新功能先对 1% 用户开，运营调后台数值 → 100% 放量，不用发版（feature flag 系统） |
+| 日志级别热切换 | 线上出问题把 `debugMode` 切成 true，日志立刻打全，不用重启 |
+| 限流/降级参数 | 流量突增调 `maxQps`；下游依赖挂了切"本地兜底"降级开关 |
+| 资源参数 | 连接池大小、超时时间、重试次数 |
+| 配置中心客户端 | Nacos / Apollo / Spring Cloud Config 推送新值 → 客户端监听器写入 volatile 字段 → 业务线程立刻读到 |
+
+> 🤔 **常见误区："配置不是发布到缓存里吗？跟 volatile 有什么关系？"**
+>
+> 你的理解没错——现代配置中心确实是"改配置 → 推送 → 各处缓存"的模式。但"缓存"最终落在 JVM 里**就是一个 Java 字段**，配置中心客户端把它存成 volatile（或内部为 volatile 的 `AtomicReference`），业务线程直接从字段读：
+>
+> ```
+> 远端配置中心/配置文件（存储层）
+>    ↓ 拉取/推送
+> JVM 里的 volatile 字段（缓存层）← "缓存"就是这里
+>    ↓ volatile 保证可见
+> 所有业务线程读到最新值
+> ```
+>
+> 所以 volatile **不是缓存的替代品，而是让缓存方案真正生效的最后一跳**：如果那个字段不加 volatile，推送线程更新了字段，业务线程却还在读自己 CPU 缓存里的旧副本——配置"改了但没生效"。这跟场景 1 的死循环是同一个问题，只是表现从"循环不退"变成"配置不生效"。
+
+**真实源码例子（Apollo 配置中心客户端，真实类简化）：**
+
+```java
+// com.ctrip.framework.apollo.internals.DefaultConfig（真实类）
+public class DefaultConfig {
+    // "缓存"就是这个字段：最新版用 AtomicReference，其内部就是 volatile V value
+    private AtomicReference<Properties> m_configProperties;
+
+    // 配置中心推送新配置时回调（配置写方，单线程）
+    public synchronized void onRepositoryChange(String namespace, Properties newProperties) {
+        Properties newConfigProperties = propertiesFactory.getPropertiesInstance();
+        newConfigProperties.putAll(newProperties);
+        // 计算变更 + 更新缓存：整体换一个新 Properties 引用
+        updateAndCalcConfigChanges(newConfigProperties, sourceType);
+        m_configProperties.set(newConfigProperties);   // 一次引用写，整体发布
+        this.fireConfigChange(...);                     // 通知监听器
+    }
+
+    // 业务线程读配置（配置读方，多线程并发读）
+    public String getProperty(String key, String defaultValue) {
+        return m_configProperties.get().getProperty(key, defaultValue);
+    }
+}
+```
+
+注意它正是文档前面说的生产姿势：**不可变对象（新 Properties 整体换引用）+ volatile（`AtomicReference` 内部）**，一次发布全体生效，业务线程永远看到完整的新/旧配置，不会混搭。
+
+> TODO: 对照 JDK 17 验证 `AtomicReference` 内部 `value` 字段的 volatile 定义；补充 Nacos 客户端（`NacosPropertySource` 的 `volatile Map data`）源码片段。参考：[Apollo 核心配置系统解析](https://deepwiki.com/apolloconfig/apollo-java/2.1-core-configuration-system)
 
 ### 场景 5：单次发布-订阅
 
