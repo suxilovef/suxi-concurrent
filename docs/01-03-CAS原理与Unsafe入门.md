@@ -325,6 +325,42 @@ ABA 问题：一个值从 A 变成 B，又变回 A，
   栈实际变成：B（错的！B 早就被 pop 走了，链向了野指针）
 ```
 
+**这里的 CAS 具体指什么？**
+
+上面 `CAS(栈顶, A, B)` 操作的对象是**栈顶指针 `top`**（一个 `AtomicReference<Node>`），不是某个节点的值。对应到无锁栈的 pop 实现：
+
+```java
+public T pop() {
+    Node oldTop, newTop;
+    do {
+        oldTop = top.get();              // ① 读当前栈顶 = A
+        if (oldTop == null) return null;
+        newTop = oldTop.next;            // ② 记下 A 的下一个节点 = B
+    } while (!top.compareAndSet(oldTop, newTop));  // ③ CAS(栈顶, A, B)
+    return oldTop.value;
+}
+```
+
+三个操作数对应关系：
+
+```
+V（内存地址） = 栈顶字段 top（栈对象里的 AtomicReference<Node>）
+A（期望值）   = 线程 1 读到的栈顶节点 A
+B（新值）     = A.next，即节点 B
+语义：如果栈顶还是 A 这个对象，就把栈顶原子地换成 A.next（B）
+     —— 相当于把 A 从栈里摘下来
+```
+
+**为什么正常情况下 CAS 是安全的**：CAS 比较的是**对象引用**（内部就是 `oldTop == top`）。线程 1 暂停期间如果有人动过栈顶，恢复后 `top` 不再是 A，CAS 失败，回到 ① 重新读取栈顶再试——这就是无锁栈靠 CAS 自旋保证正确性的机制。
+
+**ABA 是怎么坑到它的**：线程 2 的 `push A` 把**同一个 A 对象**放回栈顶（`top` 又指向 A），线程 1 恢复后引用比较仍然相等，以为没人动过，于是 CAS 成功把栈顶换成了 B。但：
+
+1. 线程 2 push 时执行了 `A.next = 当前栈顶(C)`，**A.next 已被改成 C，不再是 B**
+2. 线程 1 用的是自己之前读到的旧 `newTop = B` 去替换
+3. 结果栈顶变成 **B**——而 B 早就被线程 2 pop 走了，是已经「出栈交付给调用方」的节点
+
+> 所以正确的栈应该是 `A → C`（pop 后栈顶是 C），实际却变成了 `B → C`。上面图示里说「链向了野指针」是 C/C++ 指针的类比——在 Java 里更准确的说法是：**栈顶指向了一个已经不在栈里、内容可能已被改写的节点**。
+
 ### 5.3 如何解决
 
 **方案一：版本号（AtomicStampedReference）**

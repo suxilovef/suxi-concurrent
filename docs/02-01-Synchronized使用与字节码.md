@@ -309,12 +309,17 @@ public void updateLock() {
 ### 🕳️ 坑 3：基本类型的包装类作为锁
 
 ```java
-// ❌ 错误：Integer 有缓存池，-128~127 是同一个对象
+// ❌ 翻车 1：Integer 有缓存池，-128~127 是同一个对象
+// 自动装箱 Integer lock = 100 等价于 Integer.valueOf(100)，命中缓存
+// 全工程所有写 100 的地方都指向同一个对象 → 无意中互相阻塞
 Integer lock = 100;
 synchronized (lock) { ... }
 
-// ❌ 更隐蔽：自动装箱创建新对象
-Integer lock2 = new Integer(100);  // 不同对象！
+// ❌ 翻车 2：值相等 ≠ 同一个对象 → 互斥失效
+// 注意：new Integer(100) 不是自动装箱，每次都是全新对象（该构造器 Java 9+ 已废弃）；
+// 而自动装箱 100 拿到的是缓存对象 → 两边都以为在锁100，实际是两把不同的锁
+Integer lock2 = new Integer(100);
+synchronized (lock2) { ... }
 ```
 
 ### 🕳️ 坑 4：String 作为锁
