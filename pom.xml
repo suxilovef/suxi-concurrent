@@ -52,6 +52,26 @@
             <version>0.17</version>
             <scope>test</scope>
         </dependency>
+        <!-- JMH: 微基准测试（阶段五练习用） -->
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-core</artifactId>
+            <version>1.37</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-generator-annprocess</artifactId>
+            <version>1.37</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- Jedis: Redis 分布式锁练习用（阶段六） -->
+        <dependency>
+            <groupId>redis.clients</groupId>
+            <artifactId>jedis</artifactId>
+            <version>4.4.6</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

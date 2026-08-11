@@ -85,6 +85,14 @@ public class DeadlockDemo {
             }
         }, "T2").start();
     }
+
+    private static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
 }
 ```
 
@@ -404,18 +412,24 @@ Arthas 快速定位的完整流程：
 
 ## 6. 生产注意事项 & 常见坑点
 
-### 🕳️ 坑 1：synchronized 死锁 jstack 能检测，Lock 死锁要看日志
+### 🕳️ 坑 1：死锁检测的边界——jstack 不是万能的
 
 ```java
-// jstack 对 synchronized 死锁自动输出 "Found one Java-level deadlock"
-// 但 ReentrantLock 死锁时，jstack 不一定会输出死锁报告！
-// 原因：Lock 的等待在 AQS 队列里（park），jstack 只看到 WAITING
+// 好消息：现代 JDK（6+）的 deadlock 检测通过 ownable synchronizers 机制
+//   → jstack 对标准 ReentrantLock 死锁（互相 lock 等待）也会输出
+//     "Found one Java-level deadlock"，不是只能检测 synchronized！
 
-// ✅ 排查 Lock 死锁：
-//   1. jstack 看线程栈：找 WAITING (parking) 的线程
-//   2. 看它们分别在等哪个 AQS 锁（栈里的 AbstractQueuedSynchronizer）
-//   3. 用 Arthas thread -b
-//   4. 用 ThreadMXBean.findDeadlockedThreads()（能检测 AQS 死锁）
+// 检测不到的常见场景：
+//   ① 活锁：tryLock 循环重试（线程在跑，不是死锁）→ jstack 不报告
+//   ② Condition.await 互相等待但无锁循环 → 可能检测不到
+//   ③ 分布式死锁（跨进程）→ 单进程 jstack 无能为力
+//   ④ 资源死锁（如连接池耗尽互相等对方释放连接）→ 不是锁死锁
+
+// ✅ 排查流程建议：
+//   1. jstack -l：看 "Found one Java-level deadlock"（锁死锁）
+//   2. 没有报告但服务卡住：找大量 BLOCKED/WAITING 的线程 → 看栈
+//   3. Arthas thread -b：找"阻塞别人"的锁
+//   4. ThreadMXBean.findDeadlockedThreads()：程序化检测（含 AQS）
 ```
 
 ### 🕳️ 坑 2：锁排序时用了可变顺序
@@ -492,8 +506,8 @@ import java.util.concurrent.locks.ReentrantLock;
 /**
  * 练习 1：构造 ReentrantLock 死锁 + ThreadMXBean 程序化检测
  *
- * 注意：死锁线程会永久阻塞，测试结束时用 System.exit 兜底
- * （或让死锁线程是 daemon）
+ * 注意：死锁线程是 daemon（setDaemon(true)）——
+ *       否则测试结束 JVM 不退出（死锁线程永久阻塞在等锁），surefire 会挂住
  */
 public class DeadlockDetectTest {
 

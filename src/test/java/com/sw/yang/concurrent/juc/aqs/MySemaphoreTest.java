@@ -40,6 +40,10 @@ public class MySemaphoreTest {
                     }
                 }
             }
+
+            // getState() 是 protected，只能在 Sync（AQS 子类）内部访问
+            // 对外通过委托暴露，和 JDK Semaphore 的 sync.getPermits() 同理
+            int availablePermits() { return getState(); }
         }
 
         private final Sync sync;
@@ -48,7 +52,7 @@ public class MySemaphoreTest {
 
         public void acquire() { sync.acquireShared(1); }
         public void release() { sync.releaseShared(1); }
-        public int availablePermits() { return sync.getState(); }
+        public int availablePermits() { return sync.availablePermits(); }
     }
 
     @Test

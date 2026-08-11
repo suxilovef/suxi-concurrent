@@ -24,7 +24,8 @@ public class LockObjectTest {
             sleep(50);
         }
 
-        private void sleep(long ms) {
+        // 静态方法 incrStatic 也要用，必须是 static
+        private static void sleep(long ms) {
             try {
                 Thread.sleep(ms);
             } catch (InterruptedException e) {

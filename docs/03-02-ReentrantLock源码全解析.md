@@ -1,6 +1,6 @@
 # 03-02 ReentrantLock 源码全解析
 
-> **阶段三·第 2 篇** | 前置：[03-01-AQS框架源码解析](./03-01-AQS框架源码解析.md) | 后续：[03-03-ReentrantReadWriteLock与StampedLock](./03-03-ReentrantReadWriteLock与StampedLock.md)（待发布）  
+> **阶段三·第 2 篇** | 前置：[02-03-wait/notify与ObjectMonitor](./02-03-wait-notify与ObjectMonitor.md)、[03-01-AQS框架源码解析](./03-01-AQS框架源码解析.md) | 后续：[03-03-ReentrantReadWriteLock与StampedLock](./03-03-ReentrantReadWriteLock与StampedLock.md)（待发布）  
 > **建议时长**：5~6 小时（类结构 1h + 公平/非公平 2h + 可重入/中断/超时 1.5h + 练习 1.5h）  
 > 🛠️ **日常高频**：ReentrantLock 是显式锁的代表，理解它 = 理解 JDK 如何应用 AQS
 
@@ -159,6 +159,13 @@ public final boolean hasQueuedPredecessors() {
   h != t：有人排队 → 检查 head.next 是不是自己
     是自己 → 该我抢（我排在最前面）
     不是自己 → 有人排在我前面 → 不抢，继续等
+
+h != t 但 head.next == null 是什么情况？（竞态窗口，必须保守返回 true）
+  addWaiter 入队分两步：① CAS 把 tail 指向新节点 → ② 把旧 tail 的 next 链到新节点
+  两步之间有窗口：tail 已移走、新节点还没从 head 链过来 → 此刻 h != t 且 h.next == null
+  那个正在入队的线程马上就会排到 head.next 的位置
+  若此时返回 false 去抢锁 → 新来的插队 → 该线程被永久跳过 → 公平性被破坏
+  → 公平锁宁可多等一轮，也不能在这个窗口插队
 ```
 
 ### 3.4 公平 vs 非公平代码对比
@@ -208,8 +215,8 @@ protected final boolean tryAcquire(int acquires) {
 ```
 公平锁的问题：
   每次获取锁都要检查队列（hasQueuedPredecessors）
-  严格的 FIFO → 唤醒等待线程需要上下文切换
-  等待线程被唤醒 → 抢锁 → 可能又被别的线程"插队"？不，公平锁不会
+  严格的 FIFO → 等待线程被唤醒后一定能拿到锁（没人能插队）
+  → 但代价是：唤醒（unpark）+ 上下文切换的开销，每次锁交接都躲不掉
 
   公平锁的场景：线程 A 持有锁，线程 B 排队等待
   A 释放锁 → 唤醒 B → B 开始执行
@@ -331,19 +338,24 @@ lock.tryLock(3, TimeUnit.SECONDS);  // ④ 限时等待：3 秒内拿到 true，
 // → 都无限等待 → 死锁
 
 // ✅ 防死锁：加超时，拿不到就放弃重试
-public boolean tryAcquireBothLocks(ReentrantLock lockA, ReentrantLock lockB) {
+public boolean tryAcquireBothLocks(ReentrantLock lockA, ReentrantLock lockB) throws InterruptedException {
     if (lockA.tryLock(3, TimeUnit.SECONDS)) {   // 3 秒拿不到 A 就放弃
+        boolean gotB = false;
         try {
-            if (lockB.tryLock(3, TimeUnit.SECONDS)) {  // 3 秒拿不到 B 就放弃
-                return true;  // 两把都拿到了
-            }
+            gotB = lockB.tryLock(3, TimeUnit.SECONDS);  // 3 秒拿不到 B 就放弃
         } finally {
-            lockB.unlock();  // 拿了 B 但要放弃 → 释放 B
+            if (!gotB) lockA.unlock();  // 没凑齐 → 释放 A（A 是自己持有的，才能安全释放）
         }
+        return gotB;   // 两把都拿到 → true，由调用方释放；否则 false
     }
-    lockA.unlock();  // 拿了 A 但要放弃 → 释放 A
-    return false;    // 让调用方决定重试或降级
+    return false;      // 拿不到 A → 让调用方决定重试或降级
 }
+
+// ⚠️ 为什么不能写成"try 里 return true + finally 无条件解锁 B"？
+//   ① B 拿到时：return true 会先执行 finally → B 刚拿到就被释放 → 调用方以为持有 B，实际没有 → 临界区失控
+//   ② B 没拿到时：lockB.unlock() → 当前线程不持有 B → 抛 IllegalMonitorStateException，方法不会返回 false
+//   ③ A 没拿到时：lockA.unlock() → 不持有 A → 同样抛异常
+//   → 三条路径全错。正确做法：用布尔标志记录"B 是否拿到"，finally 只兜底"没凑齐"的情况
 ```
 
 ### 6.2 lockInterruptibly 的使用场景
@@ -371,6 +383,20 @@ try {
 ---
 
 ## 7. Condition 在 ReentrantLock 中的使用
+
+### 7.1 场景与契约
+
+```
+两个角色共享一个 LinkedList：生产者 put 往里加，消费者 take 往外拿。两条约束：
+  ① 队列满（size == CAPACITY）→ 生产者必须停下来等，直到有人拿走一个
+  ② 队列空 → 消费者必须停下来等，直到有人放进一个
+
+lock 解决互斥（同一时刻只有一个角色在碰 queue）
+Condition 解决等待与唤醒（怎么停下来、怎么被叫醒、醒来的时机）
+→ 这是两个独立的问题：互斥不保证"满了怎么办"
+```
+
+### 7.2 代码
 
 ```java
 public class ConditionDemo {
@@ -409,16 +435,338 @@ public class ConditionDemo {
 }
 ```
 
-**与 wait/notify 对比（为什么 Condition 更优）**：
+### 7.3 核心机制：await 不是"暂停"，是一次四步旅程
+
+```java
+notFull.await()  这一行，底层实际做了四件事：
+
+  ① 释放锁（state 归零，owner 置 null）       ← 关键！await 会放掉锁
+  ② 把自己挂进 notFull 的等待队列，park 挂起
+  ③ 被 signal 后：从条件队列搬到 AQS 同步队列，排队等锁
+  ④ 抢到锁 → await() 返回，此时锁又在自己手里
+```
+
+```
+为什么①必须释放锁？（因果链）
+  生产者因"队列满"而等 → 队列要变不满，只能靠消费者拿走 item
+  → 消费者要拿走 item，必须进入临界区 → 必须拿到锁
+  → 若生产者抱着锁等：锁永远在自己手里，消费者永远进不来 → 死锁
+  → 所以 await 释放锁是机制必然，不是实现细节
+
+await 与 sleep/自旋的本质区别：
+  sleep：我停，锁也停（占着锁睡）
+  await：我停，锁继续流动（放掉锁睡）
+
+第④步同样关键：await 返回时锁被重新持有，状态与 await 前一致
+  → 调用者视角："执行到这里暂停一下，然后继续"
+  → 底层已完成：释放锁 → 挂起 → 转移 → 重新抢锁 的完整循环
+```
+
+### 7.4 时序推演：空队列时 take 走一遍
+
+```
+消费者 C: lock()                        → 拿到锁
+C: queue.isEmpty() 为 true              → 临界区内检查条件
+C: notEmpty.await()：
+     ① 释放锁 (state 1→0, owner=null)
+     ② C 进入 notEmpty 条件队列，park（此刻 C 完全不占锁）
+─────────────────────────────── 锁空闲
+生产者 P: lock()                        → 拿到锁
+P: queue.add(item)                      → 队列非空
+P: notEmpty.signal()                    → 把 C 从条件队列搬到同步队列 + unpark C
+P: finally { lock.unlock() }            → 锁再空闲
+───────────────────────────────
+C: 在同步队列排队 → 抢到锁             → 非公平锁下可能被插队（见 §4）
+C: await() 返回（锁已重新持有）
+C: while 重新检查 queue.isEmpty() → false → removeFirst
+C: finally { lock.unlock() }
+```
+
+```
+关键点：signal 只是把 C 从"等条件"变成"等锁"
+  → C 此刻还没拿到锁，await 还没返回
+  → C 要等 P 释放锁、自己排队抢到锁，才能继续走
+  → "被唤醒" 和 "真正执行" 之间隔了一段不定时间
+```
+
+### 7.5 为什么是 while 而不是 if —— 被唤醒 ≠ 条件满足
+
+```
+signal 的语义：不是"条件满足了，去干活"，而是"去重新检查一下"
+
+场景：C1、C2 都在等 notEmpty，生产者 add 一个 item 后 signal（唤醒 C1）
+  C1 被搬到同步队列抢锁，但队列里还排着另一个消费者 C0（之前就在等锁）
+  若 C0 先拿到锁：removeFirst 拿走 item → 队列又空了
+  C1 拿到锁、从 await 返回后重新检查 → 空 → 必须继续等
+
+if (queue.isEmpty()) { notEmpty.await(); }    // ❌ 唤醒后直接 removeFirst → 可能 NoSuchElementException
+while (queue.isEmpty()) { notEmpty.await(); } // ✅ 唤醒后重新检查
+
+两层循环：
+  外层：业务代码的 while —— 重新检查条件（本节的论证）
+  内层：await 源码里 while (!isOnSyncQueue(node)) park —— 处理伪唤醒
+    LockSupport.park 可能无缘无故返回 → 醒来后必须确认自己真的被 signal 了
+```
+
+### 7.6 为什么是两个 Condition（与 wait/notify 对比）
 
 ```
 wait/notify 的问题：
-  只有一个等待队列 → notifyAll 唤醒所有人 → 所有人都醒 → 检查条件 → 大部分又睡回去
+  一个对象只有一个 wait set → notifyAll 唤醒所有人
+  → 生产者醒来看队列满（白醒）、消费者醒来看队列空（白醒）→ 大部分又睡回去
   → 惊群效应（Thundering Herd）
 
-Condition 的优势：
-  多个条件队列 → signal 只唤醒"正确的那一类"线程
-  → 精确唤醒，无惊群
+Condition 的增量：一个锁可以挂多个独立的等待队列
+  notEmpty 里只可能有消费者，notFull 里只可能有生产者
+  → signal 精确唤醒"正确的那一类"线程，不是全部
+  → 队列 FIFO，唤醒等待最久的那个
+  → 同类线程，signal 一个就够（一个 item 只够一个消费者；一个空位只够一个生产者）
+
+对应关系：
+  put 结束时 signal notEmpty  → 告诉消费者"来拿"
+  take 结束时 signal notFull  → 告诉生产者"来放"
+  → 交叉配对，各自只通知对方
+```
+
+### 7.7 与 02-03 的 ObjectMonitor 双队列模型对照
+
+```
+02-03 学过的模型：monitor 有 entry set（等锁）+ wait set（等条件）
+  wait 释放 monitor 进 wait set，notify 把线程从 wait set 移回 entry set
+AQS 的 Condition 完全同构：
+
+| 02-03 ObjectMonitor | 03-02 AQS/Condition | 职责             |
+|---|---|---|
+| entry set / cxq     | 同步队列（sync queue）    | 等锁的人         |
+| wait set            | 条件队列（condition queue）| 等条件的人       |
+| wait()              | await()                  | 释放锁 + 进条件队列 |
+| notify()            | signal()                 | 条件队列头 → 搬到同步队列 |
+| 拿到锁后 wait 返回   | 抢到锁后 await 返回       | 恢复执行         |
+
+唯一区别：ObjectMonitor 是"一个" wait set；Condition 支持"多个"（§7.6 的增量）
+→ 02-03 建立的双队列心智模型，原封不动搬过来就是
+```
+
+### 7.8 三个高频坑
+
+```
+① take() 的 return 在 try 里，finally 还会执行吗？
+   会。Java 语义：return 先求值 → 执行 finally → 再真正返回 → 锁一定被释放
+
+② await 抛 InterruptedException 时锁谁拿着？
+   AQS 实现里中断路径也要先重新拿到锁才抛异常 → finally 的 unlock 天然正确
+   （"await 返回时锁必然在自己手里"的另一面）
+
+③ signal 也必须持有锁
+   AQS 的 signal() 开头检查 isHeldExclusively()，不持有直接抛 IllegalMonitorStateException
+   → 与 ObjectMonitor 的 notify 规范一致（API 契约）
+   → 效果：状态变更（add/remove）与发信号在同一临界区内、顺序稳定
+     被唤醒的线程抢到锁后看到的队列状态，一定反映了 signal 线程的修改
+```
+
+### 7.9 源码走读：await()（经典版 JDK 8~20，与 03-01 同版本）
+
+```java
+public final void await() throws InterruptedException {
+    if (Thread.interrupted())                          // ① 中断前置检查
+        throw new InterruptedException();
+    Node node = addConditionWaiter();                  // ② 尾插条件队列
+    int savedState = fullyRelease(node);               // ③ 释放全部锁
+    int interruptMode = 0;
+    while (!isOnSyncQueue(node)) {                     // ④ 挂起循环
+        LockSupport.park(this);
+        if ((interruptMode = checkInterruptWhileWaiting(node)) != 0)
+            break;                                     // ⑤ 中断两模式
+    }
+    if (acquireQueued(node, savedState) && interruptMode != THROW_IE)
+        interruptMode = REINTERRUPT;                   // ⑥ 抢锁 + 恢复重入层数
+    if (node.nextWaiter != null)
+        unlinkCancelledWaiters();                      // ⑦ 清理取消节点
+    if (interruptMode != 0)
+        reportInterruptAfterWait(interruptMode);       // ⑧ 报告中断
+}
+```
+
+```
+① 为什么在入队前检查？Thread.interrupted()（静态方法，会清除中断标志）
+   已中断 → 直接抛异常 → 省掉"入队再拆队"的无效旅程（fail-fast）
+```
+
+#### ② addConditionWaiter —— 条件队列是单向链表
+
+```java
+private Node addConditionWaiter() {
+    Node t = lastWaiter;
+    if (t != null && t.waitStatus != Node.CONDITION) {  // 队尾是取消节点则先清
+        unlinkCancelledWaiters();
+        t = lastWaiter;
+    }
+    Node node = new Node(Thread.currentThread(), Node.CONDITION);
+    if (t == null) firstWaiter = node;
+    else t.nextWaiter = node;      // ★ 只连 nextWaiter
+    lastWaiter = node;
+    return node;
+}
+```
+
+```
+为什么条件队列单向、同步队列双向？
+  条件队列只有两种操作：队尾插入（await）、队头取走（signal）→ 单向够用
+  同步队列要沿 prev 回溯（改前驱状态、取消摘除）→ 必须双向
+  → 数据结构形态由操作需求决定
+
+CONDITION(-2) = "还在等条件"的身份牌：signal 与取消都靠抢这张牌定胜负（见 ⑤ 与 7.10 ④）
+```
+
+#### ③ fullyRelease —— 为什么是"全量"释放
+
+```java
+final int fullyRelease(Node node) {
+    boolean failed = true;
+    try {
+        int savedState = getState();    // 记住 state（欠了多少层）
+        if (release(savedState)) {      // ★ 一次释放全部层数
+            failed = false;
+            return savedState;          // 返回欠的层数
+        }
+        throw new IllegalMonitorStateException();
+    } finally {
+        if (failed) node.waitStatus = Node.CANCELLED;  // 防止孤儿节点被误转移
+    }
+}
+```
+
+```
+因果链：lock() × 3 后 await，若只 release(1)：
+  state = 2 ≠ 0 → owner 不清 → 其他线程永远进不来 → 死锁
+  → 必须把 state 全部归零，欠的层数记在 savedState，醒来如数偿还（⑥）
+  → 可重入（§5）在 await 里的落点
+```
+
+#### ④ 挂起循环 —— §7.5 的"内层循环"
+
+```java
+while (!isOnSyncQueue(node)) {
+    LockSupport.park(this);   // 伪唤醒可能无缘无故返回
+    ...
+}
+
+final boolean isOnSyncQueue(Node node) {
+    if (node.waitStatus == Node.CONDITION || node.prev == null)
+        return false;             // 还在条件队列
+    if (node.next != null)        // 有后继 → 一定在同步队列
+        return true;
+    return findNodeFromTail(node);// 边界：可能是队尾，从尾遍历确认
+}
+```
+
+```
+每次醒来都确认"真的被 signal 了吗"——看链接不看状态（避免与入队的竞态）
+```
+
+#### ⑤ 中断两模式 —— 与 §6 中断哲学同构
+
+```java
+private int checkInterruptWhileWaiting(Node node) {
+    return Thread.interrupted() ?
+        (transferAfterCancelledWait(node) ? THROW_IE : REINTERRUPT) : 0;
+}
+
+final boolean transferAfterCancelledWait(Node node) {
+    if (node.compareAndSetWaitStatus(node, Node.CONDITION, 0)) {  // 中断抢赢 signal
+        enq(node);           // 自己转移自己
+        return true;         // THROW_IE
+    }
+    while (!isOnSyncQueue(node))
+        Thread.yield();      // signal 先赢 → 等转移完成
+    return false;            // REINTERRUPT
+}
+```
+
+```
+中断与 signal 的竞速：同一个 CAS(CONDITION → 0) 只能赢一次
+  中断赢 → THROW_IE：取消等待，拿回锁后抛 InterruptedException
+  signal 赢 → REINTERRUPT：合法走完，中断只补记标志
+  → 与 §6 lock()/lockInterruptibly() 同构：THROW_IE = 可中断语义，REINTERRUPT = 不可中断语义
+```
+
+#### ⑥⑧ 抢锁与报告中断
+
+```
+⑥ acquireQueued(node, savedState)：03-01 学过的同步队列抢锁
+   参数是 savedState 而不是 1 → 抢回欠的层数（可重入恢复）
+   返回 true = 抢锁期间又被中断 → 升级为 REINTERRUPT
+⑧ reportInterruptAfterWait：THROW_IE → 抛异常；REINTERRUPT → 只重设标志
+   ★ 抛异常发生在重新拿到锁之后 → §7.8 坑②的源码依据：
+     await 抛异常时锁必然在自己手里，finally 的 unlock 天然正确
+```
+
+### 7.10 源码走读：signal()（经典版）
+
+```java
+public final void signal() {
+    if (!isHeldExclusively())                        // ① 必须持有锁
+        throw new IllegalMonitorStateException();
+    Node first = firstWaiter;
+    if (first != null)
+        doSignal(first);                             // ② 只动队头
+}
+
+private void doSignal(Node first) {
+    do {
+        if ((firstWaiter = first.nextWaiter) == null)
+            lastWaiter = null;
+        first.nextWaiter = null;                     // 摘出队头
+    } while (!transferForSignal(first) &&            // ③ 失败则顺延下一个
+             (first = firstWaiter) != null);
+}
+
+final boolean transferForSignal(Node node) {
+    if (!node.compareAndSetWaitStatus(node, Node.CONDITION, 0))  // ④ 与取消竞速
+        return false;
+    Node p = enq(node);                              // ⑤ 接入同步队列队尾
+    int ws = p.waitStatus;
+    if (ws > 0 || !p.compareAndSetWaitStatus(ws, Node.SIGNAL))   // ⑥ 前驱取消/设 SIGNAL 失败
+        LockSupport.unpark(node.thread);             //    → 立即 unpark，不能等接力
+    return true;
+}
+```
+
+```
+① isHeldExclusively = getExclusiveOwnerThread() == current → §7.8 坑③的源码依据
+② FIFO：唤醒等待最久的那个（一个 item 只够一个消费者，§7.6）
+③ 队头已取消 → 转移失败 → 顺延下一个 → signal 不空转
+④ 与 ⑤ transferAfterCancelledWait 抢同一张身份牌（CAS CONDITION→0）——对称竞速
+⑤ enq 到同步队列队尾 = §7.4 的"从等条件变成等锁"
+⑥ 前驱取消（ws>0，接力链断）或设 SIGNAL 失败 → 主动 unpark，否则可能永远醒不了
+
+signalAll = doSignal(first, true)，整链全部转移
+```
+
+### 7.11 本机 JDK 版本差异（JDK 21 重构版）
+
+```
+注意：03-01 与 7.9/7.10 对应经典版（JDK 8~20）
+JDK 21 重写了 AQS（本机若用 21，实际跑的是新版）：四步旅程语义不变，骨架换新
+```
+
+| 经典版（JDK 8~20） | JDK 21 | 语义 |
+|---|---|---|
+| addConditionWaiter + fullyRelease | enableWait（先查持有锁，一次完成） | ②③ |
+| isOnSyncQueue | canReacquire（沿 prev 查双向链接） | ④ |
+| LockSupport.park(this) | node.block() / ForkJoinPool.managedBlock | ④ |
+| transferForSignal（CAS + enq + 条件 unpark） | getAndUnsetStatus(COND) + enqueue | ③④ |
+| acquireQueued(node, savedState) | acquire(node, savedState, false, false, false, 0L) | ⑥ |
+| 状态：CANCELLED=1, SIGNAL=-1, CONDITION=-2, PROPAGATE=-3 | 位域：WAITING=1, CANCELLED=负数位, COND=2（COND\|WAITING 组合） | — |
+| 统一 Node | Node + ExclusiveNode/SharedNode/ConditionNode | — |
+
+```
+JDK 21 三个设计变更（"为什么"层面）：
+  1. 状态改位域，SIGNAL 握手删除：信号/取消竞速从两步 CAS 简化为一次原子位清
+  2. ConditionNode implements ForkJoinPool.ManagedBlocker：
+     FJP worker await 时 managedBlock 让池子补派线程，避免固定并行度的池被饿死
+  3. Thread.onSpinWait()：signal 已清 COND 但入队未完成时醒来 → 自旋等入队
+     （替代经典版 transferAfterCancelledWait 里的 Thread.yield()）
 ```
 
 ---
@@ -456,15 +804,21 @@ try {
 
 ```java
 // ❌ 重入了 2 次只释放 1 次 → 锁永远不会释放
+lock.lock();            // 第 1 次 → state = 1
+lock.lock();            // 重入 → state = 2
+doSomething();
+lock.unlock();          // 只释放 1 次 → state = 1 ≠ 0 → 锁还在！
+// → state 永远到不了 0 → 其他线程永远拿不到锁 → 死锁
+
+// ✅ 铁律：lock() 和 unlock() 严格配对，且用 try-finally 兜底
+lock.lock();
 lock.lock();
 try {
-    lock.lock();       // 重入 +1
     doSomething();
-    lock.unlock();     // 只减 1
 } finally {
-    lock.unlock();     // 再减 1 → state 归零？不！如果只有 2 次 lock 才行
+    lock.unlock();      // state: 2 → 1
+    lock.unlock();      // state: 1 → 0 → 真正释放
 }
-// 一定要保证 lock() 和 unlock() 严格配对
 ```
 
 ### 🕳️ 坑 4：interrupt 异常处理
@@ -651,6 +1005,7 @@ public class InterruptTest {
 ```java
 package com.sw.yang.concurrent.juc.aqs;
 
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
@@ -667,6 +1022,7 @@ public class TryLockDeadlockTest {
     private final ReentrantLock lockA = new ReentrantLock();
     private final ReentrantLock lockB = new ReentrantLock();
 
+    @Disabled("死锁演示永久阻塞非 daemon 线程，会把整个构建卡死；观察时临时启用单独运行")
     @Test
     public void testDeadlockVersion() throws InterruptedException {
         // 经典死锁：线程 1 拿 A 等 B，线程 2 拿 B 等 A
@@ -700,7 +1056,7 @@ public class TryLockDeadlockTest {
         t1.join(2000); t2.join(2000);
         System.out.println("T1 alive: " + t1.isAlive() + ", T2 alive: " + t2.isAlive());
         System.out.println("两个线程都活着 → 死锁了（lock() 无限等待）");
-        System.out.println("（这个版本会卡住测试，请单独运行或注释掉）");
+        System.out.println("（本方法默认 @Disabled，观察时临时启用并单独运行）");
     }
 
     @Test
@@ -720,11 +1076,11 @@ public class TryLockDeadlockTest {
                             lockA.unlock();  // 拿不到 B → 释放 A
                         }
                     }
+                    Thread.sleep(10);  // 随机退避后重试（中断 → 走 catch 退出）
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;
                 }
-                Thread.sleep(10);  // 随机退避后重试
             }
             System.out.println("T1 重试 5 次仍未成功，放弃");
         }, "T1");
@@ -743,11 +1099,11 @@ public class TryLockDeadlockTest {
                             lockB.unlock();
                         }
                     }
+                    Thread.sleep(10);  // 中断 → 走 catch 退出
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;
                 }
-                Thread.sleep(10);
             }
             System.out.println("T2 重试 5 次仍未成功，放弃");
         }, "T2");

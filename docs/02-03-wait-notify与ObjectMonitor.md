@@ -1,7 +1,7 @@
 # 02-03 wait / notify 与 ObjectMonitor
 
 > **阶段二·第 3 篇** | 前置：[02-02-对象头与锁升级全链路](./02-02-对象头与锁升级全链路.md) | 后续：[03-01-AQS框架源码解析](./03-01-AQS框架源码解析.md)（待发布）  
-> **建议时长**：4~5 小时（ObjectMonitor 1.5h + 正确范式 1.5h + 生产者消费者 1h + 练习 1.5h）  
+> **建议时长**：5~6 小时（设计因果链 0.5h + ObjectMonitor 1h + 正确范式 2h + 生产者消费者 0.5h + 练习 1.5h）  
 > 🛠️ **日常高频**：wait/notify 是 Java 最底层的线程协作机制，写生产者-消费者、线程协作必用
 
 ---
@@ -10,9 +10,9 @@
 
 | 标记 | 知识点 | 策略 |
 |---|---|---|
-| 🛠️ ⭐⭐⭐ | wait/notify 正确范式（while + 条件检查）、wait 释放锁、notify vs notifyAll、假唤醒 | **深入理解 + 能手写正确代码** |
-| ◈◈ | ObjectMonitor 的 _WaitSet/_EntryList 流转、wait(timeout) 超时语义、生产者-消费者两种实现 | **知道原理 + 能画出流转图** |
-| ○ | wait 的 spurious wakeup 官方文档细节 | **知道概念即可** |
+| 🛠️ ⭐⭐⭐ | wait/notify 正确范式（while + 条件检查）、wait 释放锁、notify vs notifyAll、假唤醒的防御 | **深入理解 + 能手写正确代码** |
+| ◈◈ | ObjectMonitor 的 _WaitSet/_EntryList 流转、假唤醒的四层产生机制、wait(timeout) 超时语义、生产者-消费者两种实现 | **知道原理 + 能画出流转图** |
+| ○ | wait 的 Javadoc 原文、LockSupport park/unpark 的 permit 机制 | **知道概念即可** |
 
 ---
 
@@ -33,7 +33,7 @@ Object.notifyAll()   唤醒 WaitSet 中所有线程
 调用 wait() 的线程状态：WAITING（或 TIMED_WAITING）
 
 线程状态流转：
-  RUNNABLE → WAITING（调用 wait()）→ 被 notify/notifyAll 唤醒 → RUNNABLE
+  RUNNABLE → WAITING（调用 wait()）→ 被唤醒 → BLOCKED（回 EntryList 抢锁）→ RUNNABLE（抢到锁）
 ```
 
 ---
@@ -50,7 +50,7 @@ Object.notifyAll()   唤醒 WaitSet 中所有线程
 ```
 ① 协作需要锁：共享状态必须互斥访问
 ② 锁内可能"无法继续"：消费者拿到锁，队列是空的 —— 条件不满足是业务常态
-③ 此时的三条路全堵死（三条路的完整论证见 2.3 第一层）：
+③ 此时的三条路全堵死（三条路的完整论证见 2.2 第一层）：
    持锁自旋 → 死锁；退出轮询 → 低效且竞态还在；无锁检查 → 丢唤醒
 ④ 需求：一个"交锁 + 挂起 + 不丢唤醒"的原语 → wait()
    （释放锁与挂起融合成一步原子操作，中间插不进 notify）
@@ -100,16 +100,7 @@ wait/notify = "临界区内等条件"这个普遍需求，在管程模型下的�
 生产者-消费者、线程池、AQS 的 Condition，全是这一套骨架的变体。
 ```
 
-### 2.2 源码层面的报错
-
-```java
-public void wrong() {
-    obj.wait();  // ❌ IllegalMonitorStateException!
-    // 必须持有 obj 的 monitor 才能调用 wait()
-}
-```
-
-### 2.3 根本原因：临界区内必须能"交锁等待"，而 wait 是唯一出路
+### 2.2 为什么必须在 synchronized 内（三层因果链）
 
 > ⭐⭐⭐ **面试必问**。完整因果链有三层：**设计动机 → API 语义 → 正确性问题**。
 > 别只背"检查与等待必须原子"——原子性是"手段"，不是"根因"。
@@ -144,6 +135,13 @@ wait() 的动作 = 释放当前线程持有的 monitor → 挂起 → 被唤醒�
 反证：单线程、零并发时，不在锁内调 wait() 照样抛 IllegalMonitorStateException
 —— 这跟"防竞态"无关，纯粹是 API 语义
 
+违反规则的报错现象：
+
+public void wrong() {
+    obj.wait();  // ❌ IllegalMonitorStateException!
+    // 必须持有 obj 的 monitor 才能调用 wait()
+}
+
 补充：wait() 把"释放锁 + 挂起"融合成一步原子操作，中间插不进 notify；
 LockSupport.park/unpark 则用 permit 机制实现同样的"不丢唤醒"（03-01 AQS 里细讲）
 ```
@@ -166,23 +164,6 @@ if (!queue.isEmpty()) {               queue.add(item);
 //   （检查、wait、修改条件、notify 四方形成一个原子整体，谁也没法插队）
 // → 再次强调：原子性是"手段"不是"根因"——用 CAS + LockSupport 或信号量
 //   也能实现同样的原子性，锁只是最直观的一种
-```
-
-### 2.4 正确理解：wait/notify 与锁的关系
-
-```
-wait() 做了什么：
-  1. 释放当前线程持有的锁（monitor）
-  2. 加入该对象的 WaitSet
-  3. 挂起（park）
-
-notify() 做了什么：
-  1. 从 WaitSet 中挑一个线程
-  2. 把该线程移到 EntryList（等待获取锁的队列）
-  3. 该线程重新竞争锁，抢到后从 wait() 返回
-
-→ 唤醒的线程不能立刻执行，必须先抢到锁！
-→ 这就是"wait 释放锁"的意义：不给别人释放，别人无法进入临界区去 notify
 ```
 
 ---
@@ -243,6 +224,58 @@ ObjectMonitor：
 2. 被唤醒的线程抢到锁后，从 wait() 返回，继续执行 wait() 之后的代码
 
 3. 两个队列互不干扰：EntryList 是抢锁的，WaitSet 是等通知的
+
+4. wait 释放锁的意义：不给别人释放，别人无法进入临界区去 notify
+```
+
+### 3.4 被唤醒的线程如何恢复执行（代码位置模型）
+
+> 3.3 说"从 wait() 返回，继续执行 wait() 之后的代码"——这句话的机制是什么？
+
+**关键观察：线程从未离开过 synchronized 块**
+
+```
+synchronized (lock) {
+    while (queue.isEmpty()) {   // ① 条件检查
+        lock.wait();            // ② PC 停在这一行，阻塞
+    }                           // ③ 恢复后从这里继续
+    process(queue.poll());      // ④
+}
+
+synchronized 块只有两个出口：执行完 / 抛异常。wait() 不是出口！
+→ wait() 只是块内的一条普通方法调用：
+   调用时 PC 停在 ②，返回后 PC 指向 ② 的下一条指令（回到 ① 重查）
+→ "重新抢到锁"不是"重新进入临界区"，而是 wait() 返回的前置条件：
+   JVM 保证 wait() 只有在重新获得 monitor 后才会返回，这步对调用者不可见
+```
+
+**两种视角对照**
+
+| 视角 | 看到的 |
+|---|---|
+| 锁的视角 | 释放 monitor → 挂起 → 被唤醒 → 重新抢 monitor（= 重新进入临界区） |
+| 代码的视角 | 执行到 wait() → 方法调用阻塞 → wait() 返回 → 原地继续下一条指令 |
+
+**机制实现（HotSpot 简化）**
+
+```
+wait() 内部：
+  1. 释放 monitor，把自己加进 WaitSet
+  2. park（线程挂起，PC 保留在调用 wait() 的栈帧上）
+
+被 notify 后：
+  3. 移回 EntryList，参与抢锁（monitor enter）
+  4. 抢到锁 → unpark → park 返回 → wait() 返回
+  5. JVM 从栈帧取出返回地址 → 继续执行下一条字节码
+```
+
+**与 while 的关系（为什么 if 必错）**
+
+```
+恢复点在 wait() 之后，所以恢复后第一个执行的是"wait() 后面的代码"：
+  用 if：if (isEmpty()) wait(); 后面直接是 process(poll()) → 醒来不重查 ❌
+  用 while：while (isEmpty()) { wait(); } 后面是回到循环条件 → 先重查 ✅
+→ "从 wait() 返回处继续"正是 while 循环必要性的机制根源（详见 4.2）
 ```
 
 ---
@@ -258,7 +291,12 @@ ObjectMonitor：
 规则 4：尽量用 notifyAll 而不是 notify
 ```
 
-### 4.2 为什么条件检查必须用 while（假唤醒）
+### 4.2 为什么条件检查必须用 while（竞争 + 假唤醒）
+
+> while 必须重查，原因有三，缺一不可：
+> ① 恢复点在 wait() 之后 —— if 醒来直接干活（机制见 3.4）
+> ② 竞争 —— 即使真被 notify，抢到锁前条件可能已被别的线程改掉（本节示例）
+> ③ 假唤醒 —— wait() 可能无缘无故返回（机制见 4.3）
 
 ```java
 // ❌ 错误写法：if 只检查一次
@@ -266,7 +304,7 @@ synchronized (lock) {
     if (queue.isEmpty()) {      // ① 检查
         lock.wait();            // ② 等待
     }
-    process(queue.poll());      // ③ 处理 ← 醒来后不再检查！
+    process(queue.poll());      // ③ 处理 ← 醒来后从 wait() 返回处继续执行，不再检查！（机制见 3.4）
 }
 
 // 问题场景（两个消费者 + 一个生产者）：
@@ -298,25 +336,89 @@ synchronized (lock) {
  testing for the condition that should have caused the thread to be awakened."
 
 （线程可能在没有被 notify、中断或超时的情况下被唤醒 —— 这就是假唤醒）
+```
 
-原因：操作系统层面的限制，JVM 无法完全控制线程唤醒的时机
+**产生链路（四层，从 OS 到应用）**
+
+```
+① OS 层设计取舍：park 底层是 pthread_cond_wait（Linux）/ SleepConditionVariableCS（Windows），
+   这些原语被设计成"允许假醒"——为了绝不丢唤醒（宁多醒，勿漏醒）：
+   signal 时实现可能无法精确定位该唤醒哪个等待者（等待者在组间迁移、序列号竞态），
+   保守策略是唤醒一组甚至全部 → 多醒的线程醒来一查谓词没变 = 假醒
+
+② 触发源：
+   - 保守唤醒：signal 时多唤醒线程（① 的机制，POSIX 标准明确允许）
+   - 信号：进程收到信号（jstack 的 SIGQUIT、JFR、kill 等），futex_wait 返回 EINTR 被晃醒
+   - 内核事件：线程调度迁移等其他唤醒路径
+
+③ JVM 层"安检"：park() 内部有 permit（许可）计数器
+   → 返回后检查 permit：是 1 → 真实唤醒，继续
+                             否 → 假醒！→ 重新 park（内部吸收，应用看不见）
+
+④ 规范放行：但"内部吸收"不是承诺——JVM 规范明确允许 wait() 假唤醒，
+   不同 JVM/平台行为可能不同 → 应用必须按最坏情况写
+```
+
+**两条路径的汇合点**
+
+```
+真唤醒：被 notify → 移 EntryList → 抢到锁 → unpark → park 返回 → wait() 返回
+假唤醒：park 无故返回（没有 unpark）→ permit 检查 → 假醒 → 再睡（或放行）
+
+wait() 返回前必须重新持有 monitor —— 两条路径都满足（见 3.4）
+→ 返回条件保证"锁"，但不保证"条件"，条件必须 while 重查
 
 → 防御手段：while 循环重新检查条件（而不是 if）
 ```
 
 ### 4.4 为什么推荐 notifyAll 而不是 notify
 
+**前提：WaitSet 里可能同时躺着两类等待者**
+
+```
+这个锁上其实有两个条件：
+  生产者的条件：队列不满（满了 → wait）
+  消费者的条件：队列不空（空了 → wait）
+两者共用同一个 WaitSet，而且可以同时存在——因为每个人是在
+不同时刻、不同队列状态下睡着的（见下方 t2）
+```
+
+**错误唤醒如何导致死锁（容量 1：1 生产者 P + 2 消费者 C1/C2）**
+
+```
+t0  队列空。C1、C2 发现空 → wait()               WaitSet = {C1, C2}
+t1  P 生产，队列满。P notify() → 唤醒 C1          WaitSet = {C2}
+t2  P 循环抢锁：队列满 → P 也 wait()               WaitSet = {C2, P} ← 两类共存！
+t3  C1 抢到锁，消费，队列空。C1 notify()
+    → 唤醒 P  → P 条件满足（不满）→ 生产 → 正常 ✅
+    → 唤醒 C2 → C2 重查：队列空 → 不满足 → 又 wait 回去 ❌
+
+错误唤醒的后果链（t3 的第二种分支）：
+  唤醒 C2 → 这次 notify 被浪费（C2 睡回去，白喊）
+  → 真正条件满足的 P 还睡着（它该起来生产！）
+  → 队列永远空，状态再也不变
+  → 再也不会有人 notify —— 能改状态的人正是没被唤醒的 P
+  → 所有线程挂死 ← 死锁
+```
+
+**notifyAll 为什么安全**
+
+```
+notifyAll → C1、C2、P 全部醒来 → 各自 while 重查
+→ P 条件满足 → 生产 → 状态继续变化 → notifyAll → 协议继续 ✅
+代价：C1/C2 白醒一次（短暂抢锁竞争），无害
+```
+
+**什么时候 notify 够用**
+
+```
+单生产者单消费者：WaitSet 里永远只有一类等待者，唤醒谁都是对的 → notify 安全
+多生产者多消费者：两类共存是常态 → 必须 notifyAll
+```
+
 ```java
-// ❌ notify() 的问题：
-// 1. 只唤醒一个线程，而且是"随机"的 —— 无法控制唤醒谁
-// 2. 如果唤醒的线程不满足条件（比如生产者被唤醒但队列已满）→ 它又 wait 回去
-//    而真正能处理的线程还在睡 → 死锁！
-// 3. 多个消费者场景下，可能唤醒一个"错误"的线程
-
-// ✅ notifyAll() 的好处：
-// 所有线程都醒来 → 重新检查条件 → 满足条件的线程继续
-// 虽然浪费一点（多唤醒几个），但绝对安全
-
+// ❌ notify() 的核心问题：唤醒"错误"的线程，浪费唤醒名额（机制见上方时间线）
+// ✅ notifyAll() 的好处：全部醒来 → 各自重查 → 条件满足的自然接活，绝对安全
 // ⚠️ 注意：notifyAll 唤醒的是 WaitSet 的全部，
 //    但只有抢到锁的线程才能真正从 wait 返回（移入 EntryList 排队）
 ```
@@ -361,17 +463,18 @@ public class WaitNotifyTemplate {
 
 ```
 wait(0)      = 无限等待，等价于 wait()
-wait(1000)   = 最多等 1 秒，超时自动醒来（从 WAITING 变为 RUNNABLE）
+wait(1000)   = 最多等 1 秒，超时自动醒来（WAITING → BLOCKED 抢锁 → RUNNABLE）
 
 超时醒来的线程：
   1. 自动从 WaitSet 移到 EntryList
   2. 抢到锁后从 wait() 返回
   3. 但条件不一定满足！→ 依然要用 while 循环重新检查！
 
-三种唤醒途径：
+四种唤醒途径：
   notify / notifyAll  → 手动唤醒
   wait(timeout) 超时  → 自动唤醒
   线程被 interrupt()  → 抛 InterruptedException
+  假唤醒（spurious）  → 无原因唤醒（产生机制见 4.3）
 ```
 
 ```java
@@ -810,13 +913,13 @@ public class WaitVsSleepTest {
 3. **什么是假唤醒（Spurious Wakeup）？如何防御？**
    <details><summary>答案</summary>
 
-   线程在没被 notify、中断、超时的情况下被唤醒（操作系统层面的限制）。防御：用 while 循环重新检查条件，而不是 if 只检查一次。
+   线程在没被 notify、中断、超时的情况下被唤醒。产生链路：OS 原语（pthread_cond_wait 等）为了不丢唤醒被设计成"允许假醒"（宁多醒勿漏醒），信号、保守唤醒会触发；JVM 的 park 内部有 permit 安检能吸收大部分，但规范明确允许 wait() 假唤醒（机制见 4.3）。防御：用 while 循环重新检查条件，而不是 if 只检查一次。
    </details>
 
 4. **多生产者多消费者场景为什么推荐 notifyAll？**
    <details><summary>答案</summary>
 
-   notify 是随机唤醒一个线程，可能唤醒"不满足条件"的线程（比如队列满时唤醒生产者），它检查条件后又 wait 回去，而真正能处理的线程还在睡 → 可能死锁。notifyAll 唤醒所有线程，各自重新检查条件，绝对安全。
+   notify 是随机唤醒一个线程，可能唤醒"不满足条件"的线程（比如队列满时唤醒生产者），它检查条件后又 wait 回去，而真正能处理的线程还在睡 → 可能死锁（完整时间线机制见 4.4）。notifyAll 唤醒所有线程，各自重新检查条件，绝对安全。
    </details>
 
 5. **wait(1000) 超时后，条件一定满足吗？**

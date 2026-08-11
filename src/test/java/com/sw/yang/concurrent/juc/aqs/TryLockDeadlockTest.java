@@ -1,5 +1,6 @@
 package com.sw.yang.concurrent.juc.aqs;
 
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.TimeUnit;
@@ -19,8 +20,10 @@ public class TryLockDeadlockTest {
 
     /**
      * 经典死锁：T1 拿 A 等 B，T2 拿 B 等 A → 互相等待
-     * ⚠️ 注意：这个测试会卡住（死锁），单独运行观察现象即可
+     * ⚠️ 默认禁用：t1/t2 是非 daemon 线程，死锁后永不退出，整个测试构建会被卡死。
+     * 观察方法：临时删除 @Disabled，单独运行本方法。
      */
+    @Disabled("死锁演示永久阻塞非 daemon 线程，默认跳过；观察时临时启用")
     @Test
     public void testDeadlockVersion() throws InterruptedException {
         Thread t1 = new Thread(() -> {
@@ -57,7 +60,7 @@ public class TryLockDeadlockTest {
         t2.join(2000);
         System.out.println("T1 alive: " + t1.isAlive() + ", T2 alive: " + t2.isAlive());
         System.out.println("两个线程都活着 → 死锁了（lock() 无限等待）");
-        System.out.println("（此版本会卡住，如需继续运行请注释掉或单跑）");
+        System.out.println("（本方法默认 @Disabled，观察时临时启用并单独运行）");
     }
 
     /**
@@ -79,11 +82,11 @@ public class TryLockDeadlockTest {
                             lockA.unlock(); // 拿不到 B → 释放 A
                         }
                     }
+                    Thread.sleep(10); // 随机退避后重试（中断 → 走 catch 退出）
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;
                 }
-                Thread.sleep(10); // 随机退避后重试
             }
             System.out.println("T1 重试 5 次仍未成功，放弃");
         }, "T1");
@@ -102,11 +105,11 @@ public class TryLockDeadlockTest {
                             lockB.unlock();
                         }
                     }
+                    Thread.sleep(10); // 中断 → 走 catch 退出
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;
                 }
-                Thread.sleep(10);
             }
             System.out.println("T2 重试 5 次仍未成功，放弃");
         }, "T2");
