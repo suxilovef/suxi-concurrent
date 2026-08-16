@@ -78,9 +78,24 @@ JDK 7 用 Segment（继承 ReentrantLock）：
 
 JDK 8 改用 synchronized 锁桶的头节点：
   - 粒度更细：每个桶独立加锁
-  - 锁对象是 Node 本身（不需要额外创建锁对象）
-  - JDK 6+ 对 synchronized 的优化（偏向锁/轻量级锁）让性能不输 Lock
+  - 锁对象是 Node 本身（创建即固定：final hash/key，零额外分配）
   - 代码更简洁：不需要显式加锁/释放
+  - 性能：临界区极小（单桶操作），低竞争下 synchronized 开销可忽略，
+    且竞争远低于 JDK 7 的段锁（16 段共享一把锁）
+
+为什么"锁头节点"就够？（第一性）
+  对桶的一切修改都从头部进入：要么 CAS 替换头节点，要么从头节点开始遍历
+  → 锁住头节点 = 锁住桶内所有修改的入口
+
+为什么空桶不需要锁、非空桶必须锁？
+  空桶：写入 = 一次 CAS 换头，单步原子操作 → 无锁
+  非空桶：插入 = "找尾节点 + 改 pred.next"两步，读写位置分离，
+     CAS 只能原子化其中一步 → 必须互斥
+
+为什么需要双重检查（putVal 第 ⑦ 步）？
+  锁的是"读到的头节点 f"，但 f 可能已被其他线程替换
+   （并发 CAS 插入新头 / 树化换 TreeBin）→ 锁旧头 = 锁了个寂寞
+  → 锁内再验 tabAt(tab, i) == f，不一致就重来
 
 结论：synchronized 锁头节点 + CAS 空桶 = 更细粒度 + 更低成本
 ```
@@ -96,9 +111,11 @@ private transient volatile int sizeCtl;
 // 角色 2：初始化/扩容的目标大小
 //   n * 0.75（容量 × 负载因子）
 // 角色 3：扩容进行中的低 16 位
-//   正在扩容的线程数（+1 表示有一个线程参与扩容）
+//   正在扩容的线程数（低 16 位 = 参与线程总数 + 1；加入一个线程 +1，完成一个 -1）
 // 角色 4：扩容标志（高 16 位）
-//   扩容序列号（用来标记是第几次扩容）
+//   扩容指纹 resizeStamp = numberOfLeadingZeros(容量) | 0x8000
+//   （由当前表的容量推导，不是"第几次扩容"的序号）
+//   作用：防止线程加入一个"旧表时代的扩容"（容量指纹对不上就拒绝）
 // 角色 5：默认初始值（0）
 //   未初始化时的初始状态
 ```
@@ -107,7 +124,8 @@ private transient volatile int sizeCtl;
 sizeCtl 取值与含义速查：
   0        → 表未初始化（默认）
   -1       → 有线程正在初始化
-  -(1 + N) → 有 N 个线程正在参与扩容
+  < 0      → 正在扩容：低 16 位 = 参与线程总数 + 1（只有发起者时为 2）
+              高 16 位 = 容量指纹（resizeStamp）
   正数     → 扩容阈值（容量 × 0.75）
 ```
 
@@ -248,13 +266,143 @@ static final int spread(int h) {
 ### 4.3 为什么 key/value 不能为 null？
 
 ```
-HashMap 允许 null：单线程场景，get(null) 返回 null 能区分"没有这个 key"
+HashMap 允许 null：单线程场景，get(null) 返回 null 后能用 containsKey 兜底区分
 ConcurrentHashMap 禁止 null：
   1. 并发歧义：get(key) 返回 null 时，无法区分"key 不存在"还是"key 的值是 null"
-     → 因为 map 没有加锁，无法通过"再查一次"来区分
+     → 为什么"再查一次"不可靠？（第一性）
+        单线程：get 后用 containsKey 复核，两次调用之间没有其他线程改表 → 可靠
+        并发：两次调用之间任何线程都能插入/删除 → 复核结果不可信
+        → 注意不是"map 没有加锁"的问题：即使 get 内部加锁，锁也覆盖不了
+          两次独立 API 调用之间的窗口（锁的粒度是"单方法"，歧义在"跨方法"）
+        → 根因：任何单次 API 调用都无法原子地完成"读取 + 判定"
   2. 简化代码：Doug Lea 故意设计（ConcurrentHashMap 的 Javadoc 说明）
 
 → 结论：不允许 null 是为了消除并发下的二义性，是"故意"的设计
+```
+
+### 4.4 树化判断为什么在锁外？（⭐ 设计哲学）
+
+```java
+// putVal 第 ⑩ 步——这段在 synchronized 块外面，为什么？
+if (binCount != 0) {
+    if (binCount >= TREEIFY_THRESHOLD)   // ⑩ 链表 ≥ 8 → 树化
+        treeifyBin(tab, i);
+    if (oldVal != null)
+        return oldVal;
+    break;
+}
+```
+
+```
+原因 1：treeifyBin 是"自包含"操作，自己会重新加锁
+  treeifyBin 内部：synchronized (b) + tabAt(tab, i) == b 双重检查
+  → 重新读头、重新遍历当前链表，不依赖锁内看到的视图
+
+原因 2：树化可能根本不做树化
+  容量 < 64 时 treeifyBin 走 tryPresize 去扩容（建新表 + 迁移，长操作）
+  → 绝不能持桶锁做扩容
+
+原因 3：临界区最小化
+  锁内只放"必须互斥的桶结构变更"（找尾节点 + 改 pred.next）
+  建树是 O(链长) 的节点分配，放锁外 → 其他线程能更早进入该桶
+```
+
+```
+锁外调用时桶的状态变化，treeifyBin 的应对：
+  仍是链表           → 锁当前头 + 双检通过 → 树化
+  头已被换（新插入）  → 锁新头，按当前链表重新树化
+  已是 TreeBin / ForwardingNode → b.hash >= 0 不成立 → 跳过
+
+设计哲学：判断用"触发条件"，执行以"当下状态"为准
+  binCount >= 8 只是触发条件（锁内看到的近似长度）
+  执行时以当下真实状态为准：状态变了就重新验证、按新的做
+  → 判断与执行之间允许"状态漂移"，只要每次操作自身自洽
+  与 §5 get 的弱一致性同源；同类应用：
+    addCount 里 count >= sizeCtl 只是触发，CAS 抢到扩容权才是执行
+```
+
+```
+统一模型：锁的本质 = 把"多步操作"原子化（串起 §2.2 / §4.4 / §5）
+
+  操作能不能"自我原子化" → 决定要不要锁：
+    空桶插入  单次 CAS 换槽（单步原子）         → 无锁
+    链表插入  找尾 + 改 next（两步，读写分离）   → 必须锁
+    树化      本地构建 + setTabAt（对外单步）    → 自持锁即可
+
+  锁的两个旋钮：
+    粒度（锁哪个对象）    → 桶级 vs 段级 vs 全局（§2.2）
+    临界区（持锁多久）    → 只放必须互斥的多步变更（§4.4）
+
+  自我原子化 = build-then-swap：
+    本地构建 + 单次原子替换 → 操作自己变成"单步写"，不需要外部锁配合
+    → 树化能脱掉上一把锁、重新自持锁执行；空桶 CAS 同理
+
+  闭环：
+    写路径每一步都被原子化兜住 → 读才敢不锁（§5 无锁读的地基）
+    每个操作自我原子 → "状态漂移"无害 → "触发条件/当下状态"哲学合法
+```
+
+### 4.5 树化的单写点机制：为什么桶结构变更只有一个写点？（⭐）
+
+```java
+private final void treeifyBin(Node<K,V>[] tab, int index) {
+    Node<K,V> b; int n, sc;
+    if (tab != null) {
+        if ((n = tab.length) < MIN_TREEIFY_CAPACITY)
+            tryPresize(n << 1);                       // ① 容量 < 64 → 去扩容，不做树化
+        else if ((b = tabAt(tab, index)) != null && b.hash >= 0) {  // ② 读当前头，必须还是链表
+            synchronized (b) {                        // ③ 锁"当前头节点"
+                if (tabAt(tab, index) == b) {         // ④ 双重检查：头没被换
+                    TreeNode<K,V> hd = null, tl = null;
+                    for (Node<K,V> e = b; e != null; e = e.next) {   // ⑤ 遍历链表
+                        TreeNode<K,V> p = new TreeNode<>(e.hash, e.key, e.val, null, null);
+                        if ((p.prev = tl) == null)    // ⑥ prev 指针串成双向链
+                            hd = p;
+                        else
+                            tl.next = p;
+                        tl = p;
+                    }
+                    setTabAt(tab, index, new TreeBin<K,V>(hd));   // ⑦ ★唯一写点★
+                }
+            }
+        }
+    }
+}
+```
+
+```
+"一个写点"的确切含义：对共享状态（桶槽位）的写只有 ⑦ 一次。
+  ⑤⑥ 的 new TreeNode / p.prev / tl.next 写的是自己刚创建的对象
+  → 此刻只有本线程持有引用（无别名），对其他线程不可见，不算共享写
+
+为什么这样是安全的（四个保证）：
+  1. 拷贝而非修改：旧链表一个节点都不动（只复制 key/val 引用）
+     → 并发 get 若在 ⑦ 前读到旧头，走完的是完整旧链（有效旧状态）
+  2. 构建线程私有：新节点只挂局部变量 hd/tl，写它们天然无竞争
+  3. 发布唯一：setTabAt = 数组槽位 volatile 写（与 tabAt 对称）
+     → 之前的一切写入通过 volatile 写-读 happens-before 整体可见
+     → 读线程看到的必然是完整构建的树，绝无半初始化（安全发布）
+  4. 持锁 + 双检防覆盖：任何改桶线程都必须锁"当前头"（putVal 第 ⑥ 步）
+     → ③④ 验证通过 = 本线程独占桶 → ⑦ 覆盖式写不会抹掉并发插入
+```
+
+```
+关键论证：为什么构建必须在锁内？（尾插不改头）
+
+  双检（tabAt == b）只能验证"头没变"，验证不了"链没变"
+  → 若先建树、再上锁验证、再换桶：
+    T1 读头 b 开始建树
+    T2 另一线程锁 b → 尾插新节点成功（头仍是 b！）
+    T3 拿到锁 → 双检通过 → setTabAt 换桶 → T2 的插入被整个抹掉（丢失更新）
+
+  → "读链 → 建树 → 换桶"必须处于同一持锁临界区
+  → §4.4"临界区最小化"的精确含义：不是"尽量短"，而是"不多放一步"
+
+三方并发交错，全部自洽：
+  put（等锁中）     → 树化完成 → 双检失败 → 重走循环 → 见 TreeBin → putTreeVal 插树
+  get（⑦ 前读旧头） → 走完旧链，读到树化前的完整状态（有效旧值）
+  get（⑦ 后读）    → 从 TreeBin.find 读到新树里的值
+  → 没有路径能观察到"半棵树"：结构变更的发布窗口只有一个点
 ```
 
 ---
@@ -307,8 +455,12 @@ static class Node<K,V> {
 → 即使读到"稍旧"的版本，也不会有线程安全问题（弱一致性的体现）
 
 弱一致性（Weakly Consistent）：
-  - get 可能读不到刚 put 的数据（还没发布）
-  - 但读到的一定是"有效数据"（不是半初始化/脏数据）
+  - get 可能读不到刚 put 的数据（tail 插入的最后一步 pred.next = newNode
+    这个 volatile 写尚未发生 → 新节点还没"发布"）
+  - 但读到的一定是"有效数据"：Node 通过 volatile next 发布（安全发布模式），
+    读到节点就必然读到完整字段 → 无数据竞争，不会看到半初始化/脏数据
+  - 精确表述：每个节点读取都保证是"某一时刻的最新值"，但一条链上的不同节点
+    可能来自不同写时刻 → 读到的是"混合快照"
   - 适合"缓存"类场景，不适合"必须立即看到"的场景
 ```
 
@@ -374,7 +526,7 @@ private final void transfer(Node<K,V>[] tab, Node<K,V>[] nextTab) {
             //    - 链表 → 拆成 low/high 两条链（按 hash & n）
             //    - 红黑树 → split
         }
-        // ⑥ 完成后把 nextTable 交给旧表引用？不，是通知其他线程
+        // ⑥ 每个线程完成自己的批次 → CAS sizeCtl - 1（收尾判定见 6.6）
     }
 
     // ⑦ 最后一个线程完成 → table = nextTab，sizeCtl 更新
@@ -401,6 +553,11 @@ private final void transfer(Node<K,V>[] tab, Node<K,V>[] nextTab) {
     新桶 21：Node(hash=21)
 
 → 一次遍历，拆成两条链（不用重哈希！）
+
+JDK 8 还有 lastRun 优化：
+  从链表尾部往前找"最后一段同组（hash & n 相同）的连续节点"，
+  整段 lastRun 直接搬到新桶复用（不用 new 新节点），只重建前半段
+  → 减少节点分配（多数节点落在同一组时收益明显）
 ```
 
 ### 6.5 helpTransfer —— put 时帮忙
@@ -422,7 +579,9 @@ final Node<K,V>[] helpTransfer(Node<K,V>[] tab, Node<K,V> f) {
 2. 认领：CAS 更新 transferIndex，线程自己领任务
 3. 标记：已迁移的桶放 ForwardingNode（MOVED）
 4. 协作：put/get 遇到 ForwardingNode → 帮忙/查找新表
-5. 收尾：最后一个线程负责替换 table 引用 + 重置 sizeCtl
+5. 收尾：每个线程完成批次后 CAS sizeCtl - 1；
+   当低 16 位回到基数（sc - 2 == 指纹 << 16，只剩发起者）时该线程是最后一个
+   → 替换 table 引用 + 重置 sizeCtl 为新阈值（新容量 × 0.75）
 
 好处：扩容不再"卡住"所有线程，put 线程顺路帮忙
 ```
@@ -486,7 +645,7 @@ MIN_TREEIFY_CAPACITY = 64  最小树化容量
 为什么链表 ≥ 8 才树化？
   JDK 官方注释：哈希冲突符合泊松分布（Poisson Distribution）
   当负载因子 0.75 时：
-    桶中 8 个节点的概率 ≈ 0.00000006（千万分之六）
+    桶中 8 个节点的概率 ≈ 0.00000006（亿分之六，6×10⁻⁸）
   → 链表到 8 个几乎不可能（正常哈希下）
   → 一旦出现 → 说明哈希函数出问题或恶意攻击（哈希碰撞攻击）
   → 用红黑树兜底，避免退化为 O(n)
@@ -523,12 +682,14 @@ map.merge(key, value, (v1, v2) -> combine(v1, v2));  // 原子：合并
 ### 🕳️ 坑 2：key/value 不能为 null
 
 ```java
-// ❌ NPE！CHM 不允许 null
+// ❌ NPE！CHM 不允许 null（所有公开方法，get 也不例外）
 map.put(null, "v");    // NullPointerException
 map.put("k", null);    // NullPointerException
-map.get(null);         // NPE？不，get(null) 返回 null（不抛异常，但没意义）
+map.get(null);         // NullPointerException（内部无条件调用 key.hashCode()）
 
-// 原因：并发下 get 返回 null 无法区分"不存在"和"值为 null"
+// 与 HashMap 的区别：HashMap.get(null) 有 key==null 特判（hash 取 0），CHM 没有
+// 原因：并发下 get 返回 null 无法区分"不存在"和"值为 null"（见 4.3）
+// 验证：jdk8-lab/ChmVerifyTest（JDK 8）、主工程 ChmRecursiveUpdateTest（重构版）
 ```
 
 ### 🕳️ 坑 3：不要用 size() 做精确控制
@@ -543,8 +704,17 @@ if (map.size() == 100) { ... }   // 可能不是 100
 ### 🕳️ 坑 4：computeIfAbsent 里的递归调用
 
 ```java
-// ❌ 死锁/递归异常：computeIfAbsent 内再次访问同一个 key
-map.computeIfAbsent("k", k -> map.get("k"));  // 可能递归调用（不同版本行为不同）
+// ❌ mapping 函数内回写同一个 key（不是"递归调用"，是"重入同一个桶"）
+map.computeIfAbsent("k", k -> map.put("k", "v"));   // 危险：回写路径
+map.computeIfAbsent("k", k -> map.get("k"));        // 也不对：两个版本都静默返回 null
+
+// JDK 8：computeIfAbsent 用 ReservationNode 占位（hash = -3）
+//   get 同一 key → 占位节点 find 返回 null → 函数返回 null → 不存入、不异常（静默错误）
+//   put/compute 同一 key → putVal 只识别 MOVED，遇到占位节点无事发生 → 死循环挂起
+// JDK 9+（含 JDK 17）：回写路径增加 RESERVED 检测 → 直接抛
+//   IllegalStateException("Recursive update")；get 路径仍静默返回 null
+// → 规则：mapping 函数内只能读外部数据，绝不能回写同一个 map
+// → 验证：jdk8-lab/ChmVerifyTest（JDK 8）、主工程 ChmRecursiveUpdateTest（重构版）
 ```
 
 ### 🕳️ 坑 5：遍历时的弱一致性
@@ -571,13 +741,13 @@ map.computeIfAbsent("k", k -> map.get("k"));  // 可能递归调用（不同版�
    → Node 的 val 和 next 是 volatile，读线程可见写线程的最新修改；弱一致性设计。
 
 4. **sizeCtl 的五种角色？**
-   → 0 未初始化 / -1 初始化中 / 负数低 16 位扩容线程数 / 正数扩容阈值 / 扩容序列号。
+   → 0 未初始化 / -1 初始化中 / 负数低 16 位扩容线程数（= 参与线程总数 + 1，回到 2 时最后一线程收尾）/ 正数扩容阈值 / 负数高 16 位扩容指纹（由当前容量推导，防止加入旧扩容）。
 
 5. **多线程扩容怎么协作？**
    → stride 分桶 → CAS 认领任务 → ForwardingNode 标记 → 其他线程 helpTransfer → 最后线程收尾。
 
 6. **为什么树化阈值是 8？退化是 6？**
-   → 泊松分布：正常哈希下桶中 8 节点的概率千万分之六；8/6 留缓冲避免抖振。
+   → 泊松分布：正常哈希下桶中 8 节点的概率约亿分之六；8/6 留缓冲避免抖振。
 
 ---
 
