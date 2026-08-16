@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+      JDK 8 实验区（独立于主工程，不继承 spring-boot-parent）：
+      经典版 AQS/ReentrantLock（JDK 8~13 形态）的实验代码都放这里，
+      与 docs 中"经典版"讲解逐行对应（主工程跑 JDK 17 重构版）。
+      未来任何需要 JDK 8 的章节测试，按包名加入 src/test/java 即可。
+    -->
+    <groupId>com.sw.yang</groupId>
+    <artifactId>jdk8-lab</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>jdk8-lab</name>
+    <description>JDK 8 经典版源码实验区（AQS/ReentrantLock 等，对应 docs 经典版讲解）</description>
+
+    <properties>
+        <java.version>8</java.version>
+        <maven.compiler.source>8</maven.compiler.source>
+        <maven.compiler.target>8</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <junit.version>5.10.2</junit.version>
+    </properties>
+
+    <dependencies>
+        <!-- JUnit 5.10 是支持 Java 8 的版本线 -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <!-- JDK 8 默认 file.encoding=GBK，强制 UTF-8 保证中文输出可读 -->
+                    <argLine>-Dfile.encoding=UTF-8</argLine>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

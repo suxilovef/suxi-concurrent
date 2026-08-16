@@ -1,6 +1,6 @@
 # 03-02 ReentrantLock 源码全解析
 
-> **阶段三·第 2 篇** | 前置：[02-03-wait/notify与ObjectMonitor](./02-03-wait-notify与ObjectMonitor.md)、[03-01-AQS框架源码解析](./03-01-AQS框架源码解析.md) | 后续：[03-03-ReentrantReadWriteLock与StampedLock](./03-03-ReentrantReadWriteLock与StampedLock.md)（待发布）  
+> **阶段三·第 2 篇** | 前置：[02-03-wait/notify与ObjectMonitor](./02-03-wait-notify与ObjectMonitor.md)、[03-01-AQS框架源码解析](./03-01-AQS框架源码解析.md) | 后续：[03-03-ReentrantReadWriteLock与StampedLock](./03-03-ReentrantReadWriteLock与StampedLock.md)  
 > **建议时长**：5~6 小时（类结构 1h + 公平/非公平 2h + 可重入/中断/超时 1.5h + 练习 1.5h）  
 > 🛠️ **日常高频**：ReentrantLock 是显式锁的代表，理解它 = 理解 JDK 如何应用 AQS
 
@@ -214,9 +214,10 @@ protected final boolean tryAcquire(int acquires) {
 
 ```
 公平锁的问题：
-  每次获取锁都要检查队列（hasQueuedPredecessors）
-  严格的 FIFO → 等待线程被唤醒后一定能拿到锁（没人能插队）
-  → 但代价是：唤醒（unpark）+ 上下文切换的开销，每次锁交接都躲不掉
+  竞争时锁交接的每一轮都必须走"唤醒 + 上下文切换"，躲不掉
+  —— 即使新线程人已在 CPU 上，队列里有等待者就得排队等
+  （hasQueuedPredecessors 只是两次 volatile 读，开销可忽略，不是主因）
+  → 严格的 FIFO：等待线程被唤醒后一定能拿到锁（没人能插队）
 
   公平锁的场景：线程 A 持有锁，线程 B 排队等待
   A 释放锁 → 唤醒 B → B 开始执行
@@ -362,7 +363,7 @@ public boolean tryAcquireBothLocks(ReentrantLock lockA, ReentrantLock lockB) thr
 
 ```java
 // 场景：应用关闭时，需要打断所有正在等待锁的线程
-// 线程阻塞在 lock() 上无法响应 interrupt
+// 线程阻塞在 lock() 上：不响应中断（只记录标志，继续等）→ 关不掉
 // 线程阻塞在 lockInterruptibly() 上 → interrupt → 抛异常 → 线程退出
 
 try {
@@ -440,14 +441,19 @@ public class ConditionDemo {
 ```java
 notFull.await()  这一行，底层实际做了四件事：
 
-  ① 释放锁（state 归零，owner 置 null）       ← 关键！await 会放掉锁
-  ② 把自己挂进 notFull 的等待队列，park 挂起
-  ③ 被 signal 后：从条件队列搬到 AQS 同步队列，排队等锁
+  ① 挂进 notFull 的条件队列（持锁状态下尾插 —— 条件队列的安全由锁保证）
+  ② 释放锁（state 归零，owner 置 null）       ← 关键！await 会放掉锁
+  ③ park 挂起；被 signal 后：从条件队列搬到 AQS 同步队列，排队等锁
   ④ 抢到锁 → await() 返回，此时锁又在自己手里
+
+⚠️ 为什么是"先入队、再释放、后 park"？（顺序是因果，不是实现细节）
+  条件队列的尾插发生在持锁状态下：await / signal 都必须持锁，
+  条件链表天然受锁保护 —— 若先释放锁再入队，两个并发等待者
+  就会互相踩踏链表
 ```
 
 ```
-为什么①必须释放锁？（因果链）
+为什么②必须释放锁？（因果链）
   生产者因"队列满"而等 → 队列要变不满，只能靠消费者拿走 item
   → 消费者要拿走 item，必须进入临界区 → 必须拿到锁
   → 若生产者抱着锁等：锁永远在自己手里，消费者永远进不来 → 死锁
@@ -473,8 +479,8 @@ C: notEmpty.await()：
 ─────────────────────────────── 锁空闲
 生产者 P: lock()                        → 拿到锁
 P: queue.add(item)                      → 队列非空
-P: notEmpty.signal()                    → 把 C 从条件队列搬到同步队列 + unpark C
-P: finally { lock.unlock() }            → 锁再空闲
+P: notEmpty.signal()                    → 把 C 搬到同步队列（SIGNAL 接力，此刻并不 unpark）
+P: finally { lock.unlock() }            → 锁再空闲 + unparkSuccessor 唤醒 C（接力兑现）
 ───────────────────────────────
 C: 在同步队列排队 → 抢到锁             → 非公平锁下可能被插队（见 §4）
 C: await() 返回（锁已重新持有）
@@ -661,7 +667,10 @@ final boolean isOnSyncQueue(Node node) {
 ```
 
 ```
-每次醒来都确认"真的被 signal 了吗"——看链接不看状态（避免与入队的竞态）
+每次醒来都确认"真的被 signal 了吗"——状态判断只能否定，链接才能肯定：
+  waitStatus 仍是 CONDITION / prev == null → 一定没转移（false）
+  要确认"已在同步队列"必须看链接：next 非空，或从尾遍历找到
+  （enq 过程中状态已被 CAS 成 0，单看状态无法区分"转移完成"与"转移中"）
 ```
 
 #### ⑤ 中断两模式 —— 与 §6 中断哲学同构
@@ -794,8 +803,8 @@ try {
 
 ```java
 // 应用关闭时：
-// 线程阻塞在 lock() → 无法响应 interrupt → 关不掉
-// 线程阻塞在 lockInterruptibly() → 响应 interrupt → 正常退出
+// 线程阻塞在 lock() → 不响应中断（只记录标志，继续等）→ 关不掉
+// 线程阻塞在 lockInterruptibly() → 响应中断 → 正常退出
 
 // ✅ 规范：长时间等待锁的场景用 lockInterruptibly 或 tryLock(timeout)
 ```
@@ -883,6 +892,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * 1. 一个线程持锁 100ms（制造排队）
  * 2. 10 个线程排队
  * 3. 观察获取锁的顺序是"先来先得"还是"可能插队"
+ *
+ * 注：公平锁保证的是"按 lock() 调用顺序"，不是"按线程编号"。
+ *     本实验线程按编号顺序 start，调用顺序通常近似编号，但严格不保证。
  */
 public class FairnessTest {
 
@@ -934,7 +946,7 @@ public class FairnessTest {
             System.out.print("T" + acquireOrder[i] + " ");
         }
         System.out.println();
-        System.out.println(name + "下获取顺序" + (name.equals("公平锁") ? "严格按编号" : "可能乱序（插队）"));
+        System.out.println(name + "下获取顺序" + (name.equals("公平锁") ? "通常按编号（严格说不保证，见注释）" : "可能乱序（插队）"));
     }
 }
 ```
@@ -1154,4 +1166,4 @@ public class TryLockDeadlockTest {
 
 ---
 
-> 📬 **完成练习后，进入下一篇 [03-03-ReentrantReadWriteLock与StampedLock](./03-03-ReentrantReadWriteLock与StampedLock.md)（待发布）—— 读写锁的 state 高低位拆分与乐观锁**
+> 📬 **完成练习后，进入下一篇 [03-03-ReentrantReadWriteLock与StampedLock](./03-03-ReentrantReadWriteLock与StampedLock.md) —— 读写锁的 state 高低位拆分与乐观锁**

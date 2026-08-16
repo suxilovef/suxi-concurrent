@@ -12,7 +12,8 @@
 |---|---|---|
 | 🛠️ ⭐⭐⭐ | wait/notify 正确范式（while + 条件检查）、wait 释放锁、notify vs notifyAll、假唤醒的防御 | **深入理解 + 能手写正确代码** |
 | ◈◈ | ObjectMonitor 的 _WaitSet/_EntryList 流转、假唤醒的四层产生机制、wait(timeout) 超时语义、生产者-消费者两种实现 | **知道原理 + 能画出流转图** |
-| ○ | wait 的 Javadoc 原文、LockSupport park/unpark 的 permit 机制 | **知道概念即可** |
+| ○ | wait 的 Javadoc 原文 | **知道概念即可** |
+| ○ | LockSupport park/unpark 的 permit 机制 | 见 [02-04-LockSupport与park机制](./02-04-LockSupport与park机制.md) |
 
 ---
 
@@ -143,7 +144,7 @@ public void wrong() {
 }
 
 补充：wait() 把"释放锁 + 挂起"融合成一步原子操作，中间插不进 notify；
-LockSupport.park/unpark 则用 permit 机制实现同样的"不丢唤醒"（03-01 AQS 里细讲）
+LockSupport.park/unpark 则用 permit 机制实现同样的"不丢唤醒"（详见 [02-04](./02-04-LockSupport与park机制.md)）
 ```
 
 **第三层（正确性问题）：丢唤醒（lost wakeup）才是"病"，"检查 + wait 原子"是"药"**

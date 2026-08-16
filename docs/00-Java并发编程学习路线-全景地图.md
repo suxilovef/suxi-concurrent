@@ -263,15 +263,27 @@
 | 2.5.5 | wait(timeout) 的超时语义 | ◈◈ | 避免永久等待 |
 | 2.5.6 | ObjectMonitor 中 _WaitSet 与 _EntryList 的流转 | ◈◈ | 被 notify 的线程进入 _EntryList 而非直接获取锁 |
 
-### 2.6 死锁
+### 2.6 LockSupport 与 park/unpark 线程阻塞原语
+
+> 对应文档：[02-04-LockSupport与park机制](./02-04-LockSupport与park机制.md)——AQS 阻塞线程的唯一工具，permit 机制是"不丢唤醒"的第一性原理
 
 | 序号 | 知识点 | 优先级 | 说明 |
 |---|---|---|---|
-| 2.6.1 | 死锁的四个必要条件 | ⭐⭐⭐ | 互斥/持有并等待/不可抢占/循环等待 |
-| 2.6.2 | 预防死锁的三种策略 | 🛠️ ⭐⭐⭐ | 锁排序 / tryLock 超时 / 死锁检测 |
-| 2.6.3 | jstack 死锁检测实操 | 🛠️ ⭐⭐⭐ | `jstack -l <pid>` 看 "Found one Java-level deadlock" |
-| 2.6.4 | JConsole / JVisualVM 死锁检测 | ◈◈ | 图形化工具 |
-| 2.6.5 | Java API 死锁检测：`ThreadMXBean.findDeadlockedThreads()` | ◈◈ | 程序化检测 |
+| 2.6.1 | **permit（许可）机制：unpark 可提前，唤醒信号保存到消费** | ⭐⭐⭐ | AQS 所有唤醒设计的根基 |
+| 2.6.2 | 与 wait/notify 的系统对比（依赖/信号保存/中断/超时）| ⭐⭐⭐ | 两条"不丢唤醒"路线 |
+| 2.6.3 | park 的中断响应：返回但不抛异常、标志保留 | ⭐⭐⭐ | parkAndCheckInterrupt 空转问题的根源 |
+| 2.6.4 | 伪唤醒：park 可能无缘无故返回 → 必须 while 重查 | ◈◈ | 与 wait 的假唤醒防御同构 |
+| 2.6.5 | Unsafe.park 底层与跨平台实现 | ○ | 记住 permit 是语义抽象即可 |
+
+### 2.7 死锁
+
+| 序号 | 知识点 | 优先级 | 说明 |
+|---|---|---|---|
+| 2.7.1 | 死锁的四个必要条件 | ⭐⭐⭐ | 互斥/持有并等待/不可抢占/循环等待 |
+| 2.7.2 | 预防死锁的三种策略 | 🛠️ ⭐⭐⭐ | 锁排序 / tryLock 超时 / 死锁检测 |
+| 2.7.3 | jstack 死锁检测实操 | 🛠️ ⭐⭐⭐ | `jstack -l <pid>` 看 "Found one Java-level deadlock" |
+| 2.7.4 | JConsole / JVisualVM 死锁检测 | ◈◈ | 图形化工具 |
+| 2.7.5 | Java API 死锁检测：`ThreadMXBean.findDeadlockedThreads()` | ◈◈ | 程序化检测 |
 
 ### 📖 阶段二推荐源码阅读
 
