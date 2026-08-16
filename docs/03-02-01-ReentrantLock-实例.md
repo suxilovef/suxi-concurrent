@@ -450,6 +450,8 @@ acquire 自己不碰 state、不碰队列——只把四个组件按正确顺序
 
 中断状态全程保留、只是不中断等待——这就是 `lock()` 与 `lockInterruptibly()` 的分水岭（后者把"记标志"换成"抛异常"，见场景 4）。
 
+**JDK 8 Windows 的空转上限（平台细节，因果链接 02-04 §4）**：`parkAndCheckInterrupt` 的 `interrupted()` 除了消费标志，还顺带耗尽 interrupt() 遗留的"幽灵信号"（SetEvent 残留）——若只清标志，带标志 park 立即返回的信号会挂在事件对象上，让**下一次** park 也立即返回。所以 `interrupted()` 把"无限忙循环"降级为**有限几次空转（2~3 轮）**：带标志进循环 → park#1 立即返回 → 清标志 → park#2 再空转一次（消费幽灵）→ park#3 正常阻塞。每轮循环重查条件，多几轮迭代无害；Windows console 输出还会复活幽灵（多一轮），实证见 [02-04 §4](./02-04-LockSupport与park机制.md) 与 [ParkPermitTest](../jdk8-lab/src/test/java/com/sw/yang/concurrent/juc/locks/ParkPermitTest.java)。
+
 **参数 `arg`：获取"多少个单位"**——`lock()` 传 1（每次 lock 让 state += 1）；Semaphore 传许可数。arg 原样传给 tryAcquire/acquireQueued，由子类解释——AQS 只保证"arg 被一致地传递"。
 
 **家族对照：四种获取方式 = 同一骨架的变体**：

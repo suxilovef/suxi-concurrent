@@ -56,6 +56,8 @@ public final int incrementAndGet() {
 }
 ```
 
+> ⚠️ 以上是 **JDK 8 经典版源码**。JDK 9 起（JEP 193）AtomicInteger 等改用 **VarHandle** 实现（语义相同，仍是 volatile + CAS 自旋，只是没有 Unsafe 字段）；有意思的是 LongAdder 的父类 **Striped64 在 JDK 17 仍是 Unsafe 实现**——两代实现并存。主工程跑 JDK 17（重构版），jdk8-lab 跑经典版，与 03-01/03-02 的双轨惯例一致。
+
 ---
 
 ## 2. AtomicInteger 核心方法（🛠️ 必会）
@@ -160,7 +162,15 @@ public class LockFreeStack<T> {
 }
 ```
 
-> ⚠️ 上面的栈有 **ABA 问题**（见 01-03）：push/pop 交替可能破坏结构。生产用 `AtomicStampedReference` 或 `ConcurrentLinkedQueue`。
+> ⚠️ 上面的栈有 **ABA 问题**（见 01-03）。一条具体的破坏时间线：
+>
+> ```
+> T1 读 head = A，随后被调度走
+> T2 完成：pop A → pop B → push 新 A'（栈顶又是 A'，但 B 已被弹出）
+> T1 醒来 CAS(head, A → B)：值匹配 → 成功！但 B 早被 T2 弹出了，栈结构已坏
+> ```
+>
+> 生产用 `AtomicStampedReference`（值 + 版本号一起 CAS）或 `ConcurrentLinkedQueue`。
 
 ---
 
@@ -221,8 +231,11 @@ public class FalseSharingDemo {
 ### 4.4 解决伪共享：@Contended 注解
 
 ```java
-// JDK 8+ 提供 @Contended 注解（需要 JVM 参数开启）
-// -XX:-RestrictContended
+// JDK 8 提供 @Contended 注解（需要 JVM 参数开启 -XX:-RestrictContended）
+// ⚠️ 版本差异：sun.misc.Contended 在 JDK 9 已被移除，
+//    JDK 9+ 换成 jdk.internal.vm.annotation.Contended（需 --add-exports
+//    java.base/jdk.internal.vm.annotation=ALL-UNNAMED 才能编译）
+//    主工程（JDK 17）下本示例编译不过 → 请在 jdk8-lab 子工程验证
 
 import sun.misc.Contended;
 
@@ -259,16 +272,26 @@ static final class Cell {
 ### 5.1 为什么需要 LongAdder
 
 ```
-AtomicLong 的问题（高并发下）：
-  所有线程竞争同一个 value → CAS 频繁失败 → 自旋重试 → CPU 空转
-  10 个线程竞争 1 个变量 → 9 个在自旋 → 性能差
+AtomicLong 的问题（高并发下）——两重根因：
+  ① CAS 自旋空转：所有线程竞争同一个 value → CAS 频繁失败 → 自旋重试 → CPU 空转
+     10 个线程竞争 1 个变量 → 9 个在自旋
+  ② 缓存行乒乓：每次 CAS 都是一次写操作 → 需要 RFO（read-for-ownership）→
+     其他核持有的缓存行全部失效 → 核间一致性流量占满内存总线
+     → 第 ② 重不止浪费自旋线程的 CPU，还会拖慢真正持锁的线程
+     （第一性原理：AtomicLong 把正确性代价压在了缓存一致性总线上）
 
 LongAdder 的思路（分治）：
   把 1 个变量拆成 N 个 Cell
-  每个线程随机抢一个 Cell 累加（竞争被摊薄）
+  每个线程按自身 probe 哈希"确定性"定位一个 Cell —— 不是随机抢！
+    （同一线程反复命中同一 Cell → 缓存友好；冲突时才换哈希重试）
   需要总数时，把 baseCount + 所有 Cell 相加
 
   类似"分段计数"（ConcurrentHashMap 的 CounterCell 就是抄它）
+
+为什么用 Cell 数组，而不是 ThreadLocal 每线程一个计数器？
+  ThreadLocal 无法做全局 sum：JVM 不维护可遍历的"活线程注册表"
+  （ThreadLocalMap 是弱引用挂在 Thread 上的）→ 没法优雅地遍历所有线程求和
+  Cell 数组 = 固定数组 + probe 定位 → 天然可遍历、可 O(NCPU) 求和
 ```
 
 ### 5.2 结构
@@ -313,10 +336,17 @@ public void add(long x) {
 
 ```
 add 的四个层次（逐级降级）：
-  ① 无竞争 → CAS base（一个变量就够）
+  ① cells == null 且无竞争 → CAS base（一个变量就够）
+     ⚠️ 边界：只有 cells 未初始化才尝试 base；一旦有过竞争、cells 已建，
+     之后即使无竞争也直接走 Cell 路径，不会回落
   ② 有竞争 → 用线程 hash 定位自己的 Cell → CAS 自己的 Cell
   ③ 自己的 Cell 也冲突 → longAccumulate：扩容 Cell[] / 换 Cell / 重试
   ④ 极端情况 → 全忙 → 无限重试（性能瓶颈是理论上的）
+
+为什么扩容上限是 NCPU（不无限扩）？
+  同一时刻活跃写者 ≤ CPU 核数 → Cell 数超过 NCPU 后必有线程共用 Cell
+  → 摊薄无收益，只浪费内存（每个 Cell 是 @Contended 类，至少占一个缓存行）
+  → Striped64 源码里正是 n >= NCPU 后停止扩容，改为换哈希重试
 ```
 
 ### 5.4 sum() —— 合并所有 Cell
@@ -338,6 +368,10 @@ public long sum() {
 ```
 ⚠️ sum() 不是原子操作！
   求和过程中可能有线程正在 add → 结果可能略小于实际值
+  方向性：只会偏小、不会偏大 —— sum 逐 cell 做 volatile 读，
+    若某线程的 add 发生在"该 cell 被读过之后"，这次累加就不会被计入；
+    而所有读到的都是已提交的值，不可能多算
+  另一个误差来源：sum 持有的 cells 引用是快照，扩容期间可能读到旧数组
   → LongAdder 适合"最终一致"的计数（如统计），不适合"必须精确"的计数
   → 需要精确时：同步外部手段或换 AtomicLong
 ```
@@ -347,7 +381,7 @@ public long sum() {
 | 维度 | AtomicLong | LongAdder |
 |---|---|---|
 | 原理 | CAS 自旋（单变量） | 分段累加（多 Cell） |
-| 低竞争 | ✅ 快 | 略慢（sum 要遍历） |
+| 低竞争 | ✅ 快 | 略慢（add 路径更长：probe 哈希 + cells 检查，与 sum 无关） |
 | 高竞争 | ❌ 自旋浪费 CPU | ✅ 竞争摊薄 |
 | sum() 一致性 | ✅ 强一致 | ❌ 弱一致（近似值） |
 | 内存 | 8 字节 | N × 64 字节（Cell 带填充） |
@@ -480,12 +514,23 @@ public class AtomicVsAdderTest {
 
     @Test
     public void testCompare() throws InterruptedException {
+        warmup();   // JIT 预热：编译期间第一个被测方法会系统性偏慢，先热一轮
         testAtomicLong(2);
         testLongAdder(2);
         testAtomicLong(8);
         testLongAdder(8);
         testAtomicLong(32);
         testLongAdder(32);
+    }
+
+    /** 预热：触发 AtomicLong/LongAdder 相关方法的 JIT 编译，避免污染正式结果 */
+    private void warmup() {
+        AtomicLong c = new AtomicLong(0);
+        LongAdder a = new LongAdder();
+        for (int i = 0; i < 1_000_000; i++) {
+            c.incrementAndGet();
+            a.increment();
+        }
     }
 
     private void testAtomicLong(int threads) throws InterruptedException {
@@ -547,6 +592,10 @@ public class FalseSharingTest {
     // ❌ 伪共享：count1 和 count2 相邻（同一缓存行）
     // ⚠️ 必须加 volatile —— 否则 JIT 可能把字段提升到寄存器，
     //    两个线程各自用寄存器累加，反而"更快"，结论会被反转！
+    // ⚠️ 是否真在同一缓存行取决于对象起始地址的对齐（12B 对象头 + 8B 对齐下
+    //    通常成立；若实例恰好落在缓存行尾部，两字段跨行 → 实验显示 ~1x，
+    //    结论被"对齐运气"反转）→ 建议多跑几次看稳定性。
+    //    PaddedCounters 因两 count 间距恰 64B，恒在不同行，不受对齐影响。
     static class AdjacentCounters {
         volatile long count1;
         volatile long count2;
