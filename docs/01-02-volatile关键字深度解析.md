@@ -112,7 +112,7 @@ flag = true;           // ② volatile 写    int local = sharedVar; // ④
 // 结论：local 一定是 42
 ```
 
-> ⚠️ **关键限制**：上述推导只有在**单线程顺序写 → volatile 写**时才成立。如果 A 线程先写 `flag` 再写 `sharedVar`，B 线程不一定能看到 `sharedVar` 的修改。
+> ⚠️ **关键限制**：上述推导要求"普通写与 volatile 写在**同一线程内、普通写在前**"（程序次序）。如果 A 线程先写 `flag` 再写 `sharedVar`，`sharedVar` 的写在 volatile 写**之后**，B 线程不一定能看到它。多写者场景同理：B 读到哪次发布，就看到那次发布携带的完整快照，但不同写者的普通写之间互不保证。
 
 ### 2.4 完整因果链：一条链讲透 volatile 可见性
 
@@ -120,10 +120,19 @@ flag = true;           // ② volatile 写    int local = sharedVar; // ④
 
 **第 1 环：问题从哪来（为什么必须有这套规矩）**
 
+两个独立的物理事实，叠加出"看不到 / 看乱"：
+
+**事实一：写不会立刻被所有人看到（缓存 + 写缓冲）**
 - 多核 CPU，每个核有自己的缓存（L1/L2），线程 A 跑在核 1、B 跑在核 2
-- A 的写可能还躺在自己的缓存/写缓冲里，没刷到共享内存；B 读的是自己那份缓存，可能是旧的
-- CPU 为了效率会乱序执行（把无关指令对调），编译器也会调序
-- 结果：没有规则时，B 可能看到——**旧值、半成品、乱序值**
+- A 的写先落在自己的写缓冲/缓存里，刷到共享内存是异步的；B 读自己那份缓存，可能是旧的
+- 即使写已刷出，其他核的缓存行失效（Invalidate）也有传播延迟——B 依然可能读到旧值
+
+**事实二：指令执行顺序会变（重排序）**
+- CPU 为了效率会乱序执行（把无依赖的指令对调），编译器（JIT）也会调序
+- 它们凭什么敢调？判断标准叫 **as-if-serial**：只要**单线程可观察结果**不变，顺序就是自由的；判断抓手是**数据依赖**（写后读 / 读后写 / 写后写）——没有依赖的指令 = 机器眼中的"无关指令"，随便排
+- 但"无关"是**本线程视角**的无关：`a = 1; flag = true;` 对 A 自己确实无所谓先后，可 B 能撞上"换序后的中间状态"——你写在代码里的发布关系（flag 是 a 的哨兵），机器看不到（完整机制清单见 3.2）
+
+结果：没有规则时，B 可能看到——**旧值**（写没传播）、**半成品**（发布与内容乱序）、**乱序值**（读写乱序）
 
 所以必须有一份规范，把"谁先谁后、谁看得见谁"的行为**钉死**。这就是 JMM（Java 内存模型，JLS §17.4）。
 
@@ -131,7 +140,7 @@ flag = true;           // ② volatile 写    int local = sharedVar; // ④
 
 > 若 A happens-before B，则 A 的结果对 B 可见，且 A 不会被重排到 B 之后。
 
-哪些情况算 happens-before（就 5 种，别的都不算）：
+哪些情况算 happens-before（阶段一先记这 5 行；完整的还有中断、finalizer 两条，用到时再补）：
 
 | 规则 | 条件 |
 |---|---|
@@ -154,22 +163,24 @@ JMM 给 volatile 定的条款：对 volatile 变量 v，**写 v happens-before �
 
 **第 4 环：JVM 落实（重排序有两处，屏障管两处）**
 
-重排序发生在两个地方，得两头堵：
+重排序发生在两个地方，得两头堵（具体机制清单见 3.2）：
 
-1. **编译时**（JIT 编译器换序）→ 靠编译期屏障标记拦
-2. **运行时**（CPU 乱序执行）→ 靠硬件屏障指令拦
+1. **编译时**（JIT 编译换序）→ 决策：JIT 生成机器码时决定"这段代码要不要防重排"，决定的方式是**在生成的指令里放屏障指令**
+2. **运行时**（CPU 乱序执行）→ 执行：屏障指令在 CPU 上生效——约束乱序引擎、冲刷写缓冲、触发缓存失效
 
-JVM 按 JSR-133 cookbook 的标准插屏障表（详见 3.2）：
+> 🔍 澄清一个常见误解：**"编译期屏障"和"硬件屏障"不是两种东西**。JIT 的屏障标记最终也是生成机器码里的屏障指令（x86 的 `lock` 前缀 / `mfence`）。区别只在决策时机——JIT 换序发生在生成代码时（静态），CPU 换序发生在执行时（动态），两处都要拦，但拦的工具是同一条指令链。
+
+JVM 按 JSR-133 cookbook 的标准插屏障表（详见 3.3）：
 
 | 位置 | 插什么 | 管什么 |
 |---|---|---|
 | volatile 写**前** | StoreStore | 前面的普通写不许越过写跑后面 |
-| volatile 写**后** | StoreLoad | 后面的读不许越过写跑前面 |
+| volatile 写**后** | StoreLoad | 后面的 volatile 读不许越过写跑前面（普通读越过 volatile 写是 release 语义允许的） |
 | volatile 读**后** | LoadLoad + LoadStore | 后面的读写不许越过读跑前面 |
 
 屏障是 CPU 的一条特殊指令（如 `mfence`/`dmb`），作用：① 前后指令不许跨越；② 强制把写缓冲冲刷出去、让写传播给其他核（配合缓存一致性协议）。
 
-> 同一规定，不同 CPU 执法力度不同：x86 本身序强（TSO），volatile 写 = 普通写 + `lock` 前缀指令，读甚至不用插屏障；ARM 弱序，屏障插得多。JMM 承诺的效果一样，手段不同。
+> 同一规定，不同 CPU 执法力度不同：x86 本身序强（TSO），volatile 写 = 普通写 + `lock` 前缀指令，读甚至不用插屏障；ARM 弱序，屏障插得多。JMM 承诺的效果一样，手段不同（为什么 x86 读免费、写要付钱，见 3.4）。
 
 **第 5 环：闭环（为什么 B 最终一定看到完整数据）**
 
@@ -275,7 +286,61 @@ instance.getName();        // 💥 返回 null，逻辑错乱
 
 > ⚠️ **为什么 synchronized 救不了 DCL？** 因为 B 的**第一次检查在锁外面**——看到非 null 就直接 return，根本不会进临界区。synchronized 只保护临界区内部，管不了这个无锁快速路径。只有 volatile 能保证"B 在锁外看到非 null 引用"这个时刻对象已初始化完（StoreStore 屏障：② 必须完成，③ 才允许发生，见 2.4 第 4 环）。所以 volatile 不是替代 synchronized，而是**补它管不到的那段缝隙**。
 
-### 3.2 volatile 的屏障插入策略
+> 🖥️ **平台差异：x86 上其实"碰巧不崩"，但 volatile 仍是必须的**（与 3.4 的 TSO 结论接上）
+>
+> 上面的重排是 **Store→Store**（初始化写 ↔ 引用赋值写，都是写）。3.4 会说 x86 是 TSO、**只允许 Store-Load 重排**——即 x86 硬件层面**禁止**这种换序，HotSpot 的 JIT 也不会主动把引用发布提前。所以 x86 + HotSpot 上 DCL 漏掉 volatile **实测不会崩**。
+>
+> 那 volatile 为什么还是必须的？
+> - **JMM 不保证**：规范钉的是"行为效果"，不是某个 CPU 的脾气。x86 今天禁止 Store-Store 重排，不等于规范承诺了它——正确性必须建立在规范上，才能在所有平台一致成立
+> - **换平台就崩**：ARM / POWER 是弱序模型，硬件真的会换这两个 store 的序——同一份代码 x86 上跑十年没事，部署到 ARM（手机端/部分云主机）就偶发半初始化崩溃
+>
+> 这也解释了坑 4 的"测试环境可能永远碰不到"：**"碰不到"不是因为概率低，而是 x86 根本不产生这种重排**——坑是埋给可移植性的。volatile 对应的 StoreStore 屏障在 x86 上是 no-op（TSO 天然有序），在 ARM 上才真正干活。
+
+### 3.2 重排序全景：到底发生在哪些地方
+
+重排不是一次性的——从源码到执行，每层都按**自己的规则**独立决定要不要换序：javac 不动、JIT 敢动、CPU 再动、缓存传播延迟再补一刀。按层数一遍：
+
+**第 1 层：javac（源码 → 字节码）——几乎不重排**
+
+字节码序列的顺序是源码顺序（`a = 1; flag = true;` 编译成两条顺序固定的 store）。DCL 的问题不是 javac 干的，是下一层。
+
+**第 2 层：JIT 编译（字节码 → 机器码）——重排重灾区**
+
+JIT 在生成机器码时做指令调度，以"单线程结果不变"（as-if-serial）为唯一约束。具体机制：
+
+| 优化 | 干什么 | 并发下的后果 |
+|---|---|---|
+| 循环不变量提升 | 把循环里不变的 load 提出去 | `while(!running)` 的 running 只读一次 → 死循环（场景 1 的 bug） |
+| 指令调度 | 无依赖指令换序，隐藏延迟 | `a = 1; flag = true;` 两条独立 store 被换序 |
+| 冗余 load 消除 | 同一字段的多次 load 合并 | 每次循环重读变成一次读 |
+| store 合并/延迟 | 连续写合并；store 后无读则推迟 | `a = 1` 的写晚于 `flag = true` 生效 |
+| 屏障删减 | 证明 volatile 字段单线程访问就删屏障 | 合法——JIT 有权删它证明"不需要"的屏障 |
+
+> ⚠️ 解释执行阶段不重排。同一方法：解释执行（顺序）→ JIT 编译后（可能重排）→ 逆优化后回解释器（顺序）。并发 bug"跑热了才出现、换个参数就消失"，多半是这个阶段切换。
+
+**第 3 层：CPU 执行（机器码 → 内存系统）**
+
+机器码的顺序是"死"的，CPU 执行是"活"的。四个机制：
+
+| 机制 | 干什么 | 后果 |
+|---|---|---|
+| 乱序执行引擎 | 操作数就绪即执行，不管程序顺序 | 主要影响执行时间；内存指令提交时按序 |
+| **Store Buffer（写缓冲）** | store 先进缓冲、异步刷出 | **x86 上唯一的重排来源**：先发的 store 没刷出，后发的 load 绕过缓冲直接读 → 读到旧值 |
+| Load 推测执行 | load 提前跑，读到旧值再验证 | 方向通常安全，x86 上不用管 |
+| 缓存一致性传播 | 失效消息有延迟，写传播到其他核要时间 | 观察乱序的物理延迟（配合 MESI 失效） |
+
+**弱序架构**：上面按 x86（TSO）说。ARM / POWER 全开——Store-Store、Load-Load、Load-Store、Store-Load **四种重排都可能**。这就是 DCL 在 ARM 上真崩、在 x86 上碰巧不崩的原因（见 3.1 平台差异）。
+
+**为什么必须两头堵**：每层的合法性标准不同——javac 按 JLS 语义，JIT 按 as-if-serial + JMM 承诺，CPU 按架构内存模型（TSO/weak）。JMM 钉住**最终可观察行为**，各层在授权内自由。所以 JIT 换序发生在生成代码时（静态）、CPU 换序发生在执行时（动态），两道门都要拦：
+
+| 重排发生在 | 防线 | 谁决策 |
+|---|---|---|
+| JIT 编译期（静态换序） | JIT 生成机器码时放屏障指令 | JIT（编译时） |
+| CPU 运行期（动态乱序 / 写缓冲 / 缓存传播） | 屏障指令执行时约束乱序引擎、冲刷 store buffer、触发缓存失效 | CPU（运行时） |
+
+落实下来就是 3.3 的那张屏障表。
+
+### 3.3 屏障如何拦：插入策略与执行
 
 JMM 对 volatile 变量在编译器层面插入了内存屏障：
 
@@ -311,7 +376,7 @@ volatile 读后：LoadLoad + LoadStore
 └──────────────────────────────────────┘
 ```
 
-### 3.3 x86 平台的实际实现
+### 3.4 x86 平台的实际实现：为什么读免费、写要付钱
 
 > ○ **x86 是强内存模型（TSO）**，只允许 Store-Load 重排序。所以 volatile 在 x86 上的实现很简单：
 
@@ -327,6 +392,12 @@ lock 前缀做了什么：
   - 禁止 Store-Load 重排序
 ```
 
+**为什么 x86 的 volatile 读免费、写要付钱？** 这是"每层合法性标准不同"（3.2 末尾）的直接推论：
+
+- **读 = acquire**，需要"读之后的读写不许越过读"。TSO 只允许 Store-Load 一种重排——load 不会与其他 load/store 换序，acquire 需要的顺序**架构免费提供**，volatile 读自然不需要插屏障
+- **写 = release**，需要"写之前的写不许越过写 + 写必须刷出写缓冲"。TSO 免费提供前者（Store-Store 天然有序），但**刷出 store buffer 必须显式做**——`lock` 前缀正好干这个，还顺带防了 x86 唯一的重排（Store-Load）
+- ARM 弱序：四种重排都可能，acquire/release 需要的屏障架构**都不免费**——读要插 LoadLoad/LoadStore，写要插 StoreStore/StoreLoad。JMM 承诺的效果一样，手段随架构不同
+
 > 你可以用 JITWatch + hsdis 插件观察有/无 volatile 时生成的实际汇编指令。无 volatile 时通常是普通 `mov` 指令，有 volatile 时 HotSpot 可能在写之后生成带 `lock` 前缀的屏障指令。具体形式与 JDK 版本、CPU 架构、JIT 编译阶段有关。
 
 ---
@@ -340,7 +411,8 @@ volatile int count = 0;
 
 // 10 个线程各执行 10000 次 count++
 // 预期：100000
-// 实际：通常 20000 ~ 40000（丢失率 60%~80%）
+// 实际：远低于预期，一个常见的经验区间是 20000 ~ 40000（丢失率 60%~80%）
+// 具体值随 JIT 编译状态和机器差异浮动，别当定值
 ```
 
 原因已经在 01-01 讲过，这里**聚焦于 volatile 的本质局限**：
@@ -747,7 +819,8 @@ synchronized (lock) {
 if (flag) {  // volatile 读
     synchronized (lock) {
         // 这里能看到 prepareData() 的效果吗？
-        // 能！因为 volatile 写 hb volatile 读，再通过锁的规则传递
+        // 能！光 volatile 链就够：prepareData hb flag写 hb flag读（传递性）
+        // 锁规则（unlock hb lock）是多余加成，不是必要条件
     }
 }
 ```
@@ -759,8 +832,10 @@ if (flag) {  // volatile 读
 private static Singleton instance;  // 没有 volatile
 
 // 问题：new 重排序导致其他线程看到半初始化对象
-// 几率极低，但在高并发场景下偶发 → 最难排查的那种 bug
-// 测试环境可能永远碰不到，一到生产就偶发崩溃
+// 但注意：在 x86 上几乎不会发生（TSO 禁止 Store-Store 重排，见 3.1 平台差异）
+// ——"偶发"的真实来源是 JMM 不保证 + 弱序平台（ARM/POWER）
+// 测试环境可能永远碰不到，一到 ARM 服务器/其他 JVM 上就偶发崩溃
+// → 最难排查的那种 bug：看起来没坏，但代码是错的
 ```
 
 ---
@@ -810,30 +885,27 @@ public class VolatilePracticeTest {
     @Test
     public void testGracefulShutdown() throws InterruptedException {
         Thread worker = new Thread(() -> {
+            // ⚠️ 循环体必须是"忙等"：不能有 Thread.sleep / println 等
+            //    含内存屏障的操作（见坑 1）——否则无 volatile 时也会碰巧退出，
+            //    观察不到差异
             while (running) {
-                // 模拟处理任务
-                processedCount.incrementAndGet();
-                try {
-                    Thread.sleep(10); // 模拟 IO 操作
-                } catch (InterruptedException e) {
-                    // 中断不是用来停止的，而是用来唤醒的
-                    // 还是要通过 running 标志位来判断
-                    System.out.println("Worker 被中断唤醒");
-                }
+                processedCount.incrementAndGet(); // 模拟处理任务（纯 CPU，无屏障）
             }
             System.out.println("Worker 检测到 running=false，开始清理...");
             System.out.println("Worker 安全退出，共处理: " + processedCount.get());
         }, "worker");
         worker.start();
 
-        // 让 worker 跑一会儿
+        // 让 worker 跑一会儿，给 JIT 编译时间
+        //（无 volatile 时 JIT 把 running 提升出循环 → 循环永不退出）
         Thread.sleep(2000);
         System.out.println("已处理 " + processedCount.get() + " 个任务");
 
         // 优雅停机
         System.out.println("发送停机信号...");
         running = false;
-        worker.interrupt();  // 如果 worker 在 sleep 里，需要中断唤醒
+        // 忙等循环不会阻塞，不需要 interrupt 唤醒；
+        // interrupt 只用于唤醒"阻塞中的任务"（如 sleep / wait / blockingQueue.take）
 
         worker.join(3000);
         System.out.println("停机后任务数: " + processedCount.get());

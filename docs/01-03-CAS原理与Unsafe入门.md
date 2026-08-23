@@ -2,6 +2,7 @@
 
 > **阶段一·第 3 篇** | 前置：[01-02-volatile关键字深度解析](./01-02-volatile关键字深度解析.md) | 后续：[02-01-Synchronized使用与字节码](../02-01-Synchronized使用与字节码.md)（待发布）  
 > **建议时长**：3~4 小时（原理 1h + 源码阅读 1h + 动手练习 1.5h）  
+> **源码口径**：JDK 17
 > **角色**：承上启下 — 衔接 volatile 的可见性 + 为阶段三 AQS 做铺垫
 
 ---
@@ -39,12 +40,25 @@ if (V.get() == A) {
 
 ```
 volatile：保证可见性，不保证原子性
-synchronized：保证原子性，但涉及线程阻塞（重量级）
+synchronized：保证原子性，但竞争激烈时涉及线程阻塞（重量级）
 
 问题：有没有一种方式，既保证原子性、又不阻塞线程？
 
 答案：CAS → 无锁并发（Lock-Free）的基石
 ```
+
+**但先把这个"免费答案"拆穿——CAS 不是白赚，是两个维度的代价迁移：**
+
+| 维度 | synchronized | CAS | CAS 付出的代价 |
+|---|---|---|---|
+| 原子性范围 | 任意代码区间（临界区） | **单变量的读-比较-写** | 范围收窄：只解决"一次读-改-写" |
+| 等待方式 | 挂起线程、让出 CPU（贵在切换） | **自旋重试**（贵在 CPU 空转） | 阻塞换成忙等：竞争激烈时可能更糟 |
+
+所以 CAS 的完整表述是：
+
+> **把原子性从"临界区互斥"降级为"单变量原子更新"、把等待从"线程切换"换成"自旋重试"的有条件赢家。**
+
+适用条件藏在代价里：临界区极短（重试成本 < 切换成本）+ 竞争不激烈（自旋不会空转太久）。条件不满足时（长临界区、高竞争），锁反而更优（见 6.2）。
 
 ### 1.3 三个操作数的含义
 
@@ -104,6 +118,8 @@ public class AtomicInteger {
 }
 ```
 
+> 📌 **与 JDK 真实实现的关系**：JDK 8+ 的 `incrementAndGet()` 是一行 `U.getAndAddInt(this, VALUE, 1) + 1`，自旋在 `getAndAddInt` 内部（模式见 4.1）。本处拆成 current/next 三步是为了展示"读-算-写"语义——两种写法等价，真实实现是 4.1 的单变量模式。
+
 **流程图**：
 
 ```
@@ -133,12 +149,33 @@ public class AtomicInteger {
                               └──→ 回到 volatile 读
 ```
 
-### 2.3 为什么 CAS 不需要加锁
+### 2.3 CAS 与内存屏障：为什么 value 必须是 volatile
+
+承接 01-02 的屏障知识，把"黄金组合"的最后一环补上。
+
+**x86 上 `lock cmpxchg` = 原子操作 + 全屏障（full fence）**：
+
+```
+lock 前缀在 CAS 上做了三件事：
+  ① 原子：比较-交换一气呵成（缓存行锁，防并发插入）
+  ② 顺序：禁止 Store-Load 重排（01-02 讲过的 TSO 唯一漏洞）
+  ③ 传播：冲刷 store buffer，写回立刻对其他核可见
+```
+
+所以 **CAS 成功的写回自带 volatile 写的传播效果**——那 `value` 为什么还必须 volatile？两层原因：
+
+1. **自旋的读需要 acquire**：`current = value` 每次循环都要看到最新值——否则 JIT 可能把这次读提升出循环（01-02 场景 1 的死循环），读到旧值还会无谓重试。volatile 读保证"读之后的操作不越过读"
+2. **其他线程不经 CAS 的普通读需要可见性**：`get()` 就是普通读——CAS 的屏障只约束执行 CAS 的线程，管不了别的线程读 `value`。字段不是 volatile，`get()` 可能被 JIT 缓存成永远读到旧值
+
+> 💡 成本结构（复用 01-02 的结论）：x86 上 volatile 读免费、写要 `lock`。所以 CAS 自旋每次迭代 = 免费读 + 贵的 `lock cmpxchg`——开销大头在 CAS 指令本身，竞争越激烈重试越多、越贵（见 6.1）。
+
+### 2.4 为什么 CAS 不需要加锁
 
 ```
 传统锁（synchronized / ReentrantLock）：
-  线程获取不到锁 → 操作系统将其挂起 → 上下文切换 → 等待唤醒
+  锁膨胀后（真竞争）→ 线程获取不到锁 → 操作系统将其挂起 → 上下文切换 → 等待唤醒
   → 每次挂起/唤醒涉及用户态↔内核态切换，开销大
+  （注：未膨胀时 synchronized 有偏向锁/轻量级锁，先在用户态自旋，见 6.2）
 
 CAS：
   线程 CAS 失败 → 重新读取值 → 再次 CAS
@@ -184,6 +221,8 @@ public final native boolean compareAndSwapObject(Object o, long offset,
 // x       — 新值
 ```
 
+> 📌 JDK 9+ 新增 `weakCompareAndSet{Int/Long/Object}` 弱化版（允许意外失败、不保证顺序语义），JUC 内部的自旋用的是弱化版；`compareAndSwap*` 是经典 API，语义最强。见 4.1。
+
 **参数中的 `offset` 是什么**：
 
 ```
@@ -191,11 +230,12 @@ public final native boolean compareAndSwapObject(Object o, long offset,
 
 ┌──────────────┬──────────────┬──────────────────┐
 │  Mark Word   │  Klass Pointer│  实例数据（字段）  │
-│  (8/12 bytes)│  (4/8 bytes)  │  offset 偏移量   │
+│  (8 bytes)   │  (4/8 bytes)  │  offset 偏移量   │
 └──────────────┴──────────────┴──────────────────┘
                                      ↑
                               offset 就是字段相对于对象起始位置的偏移量
                               通过 Unsafe.objectFieldOffset() 获取
+                              （64 位 JVM 对象头共 12~16 字节；32 位 JVM 是 4+4=8 字节）
 ```
 
 ### 3.3 Unsafe 的其他能力（知道即可，○）
@@ -238,12 +278,13 @@ public static Unsafe getUnsafe() {
 ### 4.1 基础自旋模式
 
 ```java
-// 标准的 CAS 自旋模式（AtomicInteger 的精简版）
+// JDK 8+ 的真实自旋模式（getAndAddInt 的语义）
+// JDK 9+ 内部实际用 getIntVolatile + weakCompareAndSetInt（弱化版，见 3.2 说明）
 public final int getAndAddInt(Object o, long offset, int delta) {
     int v;
     do {
         v = getIntVolatile(o, offset);  // ① volatile 读，取当前值
-    } while (!compareAndSwapInt(o, offset, v, v + delta));  // ② CAS，失败则重试
+    } while (!weakCompareAndSetInt(o, offset, v, v + delta));  // ② CAS，失败则重试
     return v;
 }
 ```
@@ -392,6 +433,17 @@ ref.compareAndSet("A", "B", false, true);
 
 > 大多数使用 CAS 的场景（如 AtomicInteger 自增、LongAdder 计数），ABA 不产生实质性危害，不需要额外处理。只有**引用类型的 CAS**（链表、栈等数据结构）才需要关注。
 
+> 🎯 **引用 CAS 的边界：比较的是引用，不是内容**（和 01-02 场景 4 的"统一原则"是同一件事）
+>
+> `AtomicReference` 的 CAS 比较的是引用那 8 个字节的位模式——它回答的是**"引用没被换过"**，不是**"对象状态没变过"**。对象内部字段被就地修改，引用不变，CAS 照样成功：
+>
+> ```java
+> box.setValue(42);                 // 改内容，没换引用
+> ref.compareAndSet(box, newBox);   // ✅ 成功——CAS 对内容变化无感
+> ```
+>
+> 想保护内容，要么**不可变对象 + 整体换引用**（内容变 → 引用必变 → CAS 能识别），要么内容字段用原子类/锁。5.2 栈例子里线程 2 改 `A.next` 就是这个边界踩坑的实际案例——"引用没换、内容已变"，CAS 认不出来。这也和 ABA 同源：CAS 的"相等"是引用位模式相等，想让它识别什么变化，就得把变化编码进引用或版本号里。
+
 ---
 
 ## 6. CAS 的开销与局限
@@ -422,7 +474,7 @@ CAS 适合：竞争不激烈、临界区极短（几条指令）
 
 锁适合：竞争激烈、临界区较长（几十条指令以上）
   → 竞争激烈时 CAS 反复失败 → CPU 空转 → 不如阻塞等待
-  → synchronized 在 JDK 8+ 下经过大量优化，短临界区性能接近 CAS
+  → synchronized 有锁升级优化（偏向锁/轻量级锁，JDK 6+ 起），短临界区性能接近 CAS
 ```
 
 ### 6.3 破除迷信：无锁不一定比有锁快
@@ -472,13 +524,14 @@ while (!U.compareAndSwapInt(this, OFFSET, current, next)) {
     next = current + 1;
 }
 
-// ✅ 生产代码应该加上自旋次数监控
+// ✅ 可以考虑加自旋次数监控（仅用于诊断）
+// 注意：AtomicInteger 的生产实现并不这么做；告警阈值按压测定，别拍脑袋
 int retries = 0;
 while (!U.compareAndSwapInt(this, OFFSET, current, next)) {
     current = get();
     next = current + 1;
     if (++retries > 1000) {
-        // 告警：竞争太激烈，考虑换方案
+        // 告警：竞争太激烈，考虑换方案（LongAdder / 锁）
     }
 }
 ```
@@ -597,7 +650,7 @@ class MyCasCounter {
 }
 ```
 
-### 练习 2：对比 CAS vs synchronized 的性能差异（30 分钟）
+### 练习 2：对比 CAS vs synchronized 在不同竞争强度下的表现（30 分钟）
 
 ```java
 package com.sw.yang.concurrent.jmm;
@@ -606,64 +659,76 @@ import org.junit.jupiter.api.Test;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 练习 2：简单对比 CAS 自旋 vs synchronized 在不同竞争强度下的表现
+ * 练习 2：对比 CAS 自旋 vs synchronized 在不同竞争强度下的表现
  *
- * 结论预览（你需要实际运行验证）：
- *  - 低竞争时：CAS 略快
- *  - 高竞争时：synchronized 更稳定（CAS 自旋大量失败重试）
+ * 竞争强度 = 并发线程数（1 个线程 ≈ 无竞争，16 个线程 ≈ 高竞争）
+ * 结论预览（你需要实际运行验证，单次噪声大，多跑几次看趋势）：
+ *  - 低竞争（1~2 线程）：CAS 略快
+ *  - 高竞争（8+ 线程）：synchronized 更稳定（CAS 自旋大量失败重试）
  *  - 更精确的对比需要用 JMH（阶段五会学）
  */
 public class CasVsSyncTest {
 
-    private static final int THREADS = 10;
     private static final int ITERATIONS = 100_000;
+    private static final int[] THREAD_COUNTS = {1, 2, 4, 8, 16};
 
     @Test
-    public void testCasPerformance() throws InterruptedException {
-        AtomicInteger casCounter = new AtomicInteger(0);
-        long start = System.currentTimeMillis();
-
-        Thread[] threads = new Thread[THREADS];
-        for (int i = 0; i < THREADS; i++) {
-            threads[i] = new Thread(() -> {
-                for (int j = 0; j < ITERATIONS; j++) {
-                    casCounter.incrementAndGet();
-                }
-            });
-            threads[i].start();
+    public void testCasVsSync() throws InterruptedException {
+        for (int threads : THREAD_COUNTS) {
+            long casMs = runCas(threads);
+            long syncMs = runSync(threads);
+            System.out.println("线程数=" + threads
+                    + "  CAS: " + casMs + "ms  synchronized: " + syncMs + "ms"
+                    + (casMs < syncMs ? "  → CAS 快" : "  → synchronized 快"));
         }
-        for (Thread t : threads) t.join();
-
-        System.out.println("CAS AtomicInteger: " + (System.currentTimeMillis() - start) +
-                "ms, 结果=" + casCounter.get());
     }
 
-    @Test
-    public void testSyncPerformance() throws InterruptedException {
+    private long runCas(int threadCount) throws InterruptedException {
+        AtomicInteger counter = new AtomicInteger(0);
+        long start = System.currentTimeMillis();
+        runAll(threadCount, () -> counter.incrementAndGet());
+        long cost = System.currentTimeMillis() - start;
+        check(counter.get(), threadCount);
+        return cost;
+    }
+
+    private long runSync(int threadCount) throws InterruptedException {
         Object lock = new Object();
         int[] counter = {0};
         long start = System.currentTimeMillis();
+        runAll(threadCount, () -> {
+            synchronized (lock) {
+                counter[0]++;
+            }
+        });
+        long cost = System.currentTimeMillis() - start;
+        check(counter[0], threadCount);
+        return cost;
+    }
 
-        Thread[] threads = new Thread[THREADS];
-        for (int i = 0; i < THREADS; i++) {
+    private void runAll(int threadCount, Runnable task) throws InterruptedException {
+        Thread[] threads = new Thread[threadCount];
+        for (int i = 0; i < threadCount; i++) {
             threads[i] = new Thread(() -> {
                 for (int j = 0; j < ITERATIONS; j++) {
-                    synchronized (lock) {
-                        counter[0]++;
-                    }
+                    task.run();
                 }
             });
             threads[i].start();
         }
         for (Thread t : threads) t.join();
+    }
 
-        System.out.println("synchronized: " + (System.currentTimeMillis() - start) +
-                "ms, 结果=" + counter[0]);
+    private void check(int actual, int threadCount) {
+        int expected = threadCount * ITERATIONS;
+        if (actual != expected) {
+            System.out.println("❌ 结果错误: 实际=" + actual + ", 预期=" + expected);
+        }
     }
 }
 ```
 
-### 练习 3：ABA 问题模拟（可选，15 分钟）
+### 练习 3：AtomicStampedReference 机制演示（可选，15 分钟）
 
 ```java
 package com.sw.yang.concurrent.jmm;
@@ -672,14 +737,15 @@ import org.junit.jupiter.api.Test;
 import java.util.concurrent.atomic.AtomicStampedReference;
 
 /**
- * 练习 3：模拟 ABA 问题 + AtomicStampedReference 修复
+ * 练习 3：演示 AtomicStampedReference 的版本号机制
  *
- * 场景简化版：
- * 1. 线程 1 读到一个值 A，准备 CAS 成 C，但被暂停
- * 2. 线程 2 把 A 改成 B，又改回 A
- * 3. 线程 1 恢复，CAS(A→C) 成功 —— 但中间已经发生过 A→B→A 的变化！
+ * ⚠️ 注意：本练习是"机制演示"（单线程顺序调用），不是 ABA 危害的模拟——
+ *    ABA 的危害需要并发 + 引用复用（无锁栈被破坏，见 5.2），单线程模拟不出来
  *
- * AtomicStampedReference 用版本号避免了这个问题
+ * 演示内容：
+ * 1. 每次 CAS 都带版本号，值每变一次版本号 +1
+ * 2. 用"旧版本号"做 CAS → 失败（ABA 被阻止）
+ * 3. 用"当前版本号"做 CAS → 成功
  */
 public class AbaProblemTest {
 
