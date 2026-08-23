@@ -81,6 +81,8 @@ demo.m2();  // 锁 Demo.class
 ```
 
 > ⚠️ **面试必考**：`this` 锁和 `Class` 锁是两把锁，互不干扰。
+>
+> 💡 **延伸：那共享的静态数据谁来守？**——"两把锁互不干扰"本身无害；但若**实例方法和静态方法都改写同一份静态数据**，两把锁各锁各的、临界区并发执行 → 数据竞争。守静态共享数据的正解不是记住所有调用点，而是让锁收敛到数据身边（详见 §5 坑 6）。
 
 ---
 
@@ -353,6 +355,49 @@ public void saveOrder(Order order) {
     sendMsg(order);
 }
 ```
+
+### 🕳️ 坑 6：静态共享数据用了"局部"的锁
+
+```java
+// ❌ 错误：同一份静态数据，一半用 this 锁，一半用 Class 锁
+public class Counter {
+    private static int shared = 0;
+
+    public synchronized void incrInstance() {      // 锁 this
+        shared++;
+    }
+
+    public static synchronized void incrStatic() { // 锁 Counter.class
+        shared++;
+    }
+}
+// 两个线程分别调两个方法 → 锁不同 → 并发改写 shared → 丢更新
+```
+
+**根因**：`static` 变量是跨所有实例共享的全局资源，而 `synchronized(this)` 是每实例一把锁——**锁的作用域覆盖不了数据的作用域**。靠"所有调用者自觉用对锁"是守不住的：你不可能知道这个类的方法都在哪里被调用（与坑 1"锁的不是你想的对象"同源）。
+
+**规避（按优先级）**：
+
+```
+① 消灭可变的静态共享状态（最优）
+   → 静态计数器 → AtomicInteger / LongAdder（锁被封装进类型，谁调用都不会错）
+   → 静态缓存   → ConcurrentHashMap / 缓存框架
+   → 配置       → 不可变（final），读时惰性加载一次
+
+② 锁收敛到数据身边（治存量代码）
+   private static int total = 0;
+   private static final Object TOTAL_LOCK = new Object();  // 数据专属锁，私有
+   public static void incrTotal() { synchronized (TOTAL_LOCK) { total++; } }
+   public void onOrderCreated() { incrTotal(); }  // 实例方法也走同一个专用锁
+   → 静态字段改 private、只暴露受保护方法 → 调用者只能走你的 API，无法用错锁
+
+③ 设计规则（落到代码审查 / 静态扫描）
+   同一份静态数据的所有改写者必须用同一把锁：
+   要么全部 static synchronized，要么全部走同一个专用锁对象
+   —— 禁止一半实例锁一半类锁
+```
+
+> 锁是共享状态的症状修补，不是第一选择。**减少共享可变状态**永远优先于"把锁用好"。
 
 ---
 
