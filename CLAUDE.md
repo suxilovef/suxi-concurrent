@@ -12,6 +12,7 @@ Java 并发学习仓库：`docs/` 下 21 篇学习文档（00 全景地图 → 0
 - 入口：`docs/00-Java并发编程学习路线-全景地图.md`（含第一性原理骨架 + 手段光谱 + 优先级统计）
 - 02-03 已重构：第 2 节三层因果链、3.4 代码位置模型、4.3 假唤醒四层机制
 - 03-02 §7 已补全：Condition 四步旅程机制（7.3~7.8）、经典版源码走读（7.9/7.10）、JDK 21 差异对照（7.11）
+- 90-知识树-全局总纲：因果链骨架版全景；SVG 放大版在 `docs/assets/`，改 mermaid 代码后跑 `bash scripts/export-mermaid.sh [docs/某文档.md]` 重导（浏览器路径在 `.tmp-mermaid/pp.json`，本机 Edge，换机器需改）
 
 ## 构建注意
 - pom 目标 Java 17；若默认 `java` 是 JRE 而非 JDK，编译报 "No compiler provided" 时需设 `JAVA_HOME` 指向真实 JDK（本机具体路径见本地记忆 build-env）

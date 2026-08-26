@@ -31,3 +31,6 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### mermaid 导出临时文件（本机浏览器配置，不入库） ###
+.tmp-mermaid/
