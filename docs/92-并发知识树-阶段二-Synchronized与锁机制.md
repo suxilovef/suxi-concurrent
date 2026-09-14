@@ -32,7 +32,7 @@ flowchart LR
         W1 -->|"重量锁获取要进内核态，太贵 → 按竞争分档"| W2["无锁"]
         W2 -->|"单线程反复获取 → 一次 CAS 写线程ID"| W3["偏向锁"]
         W3 -->|"其他线程竞争 → 撤销<br/>原线程存活需 SafePoint STW（零共享写 与 可判断 物理互斥）"| W4["轻量锁：CAS 指向栈上 LockRecord"]
-        W4 -->|"检测到竞争（CAS 失败）即膨胀<br/>自旋发生在膨胀后的 monitor 获取路径"| W5["重量锁：ObjectMonitor 内核阻塞 + 自适应自旋"]
+        W4 -->|"检测到竞争（CAS 失败）即膨胀<br/>自旋发生在膨胀后的 monitor 获取路径"| W5["重量锁：ObjectMonitor 内核阻塞 + 自适应自旋<br/>（monitor 内部三个队列 → 见 02-03）"]
         W3 -->|"撤销昂贵（SafePoint STW）+ 收益变小<br/>→ JDK15 默认禁用偏向锁"| W6["版本：JDK8 四态 / JDK17 三态"]
     end
 
@@ -43,7 +43,9 @@ flowchart LR
         N0["持锁自旋=死锁 / 退出轮询=低效+竞态<br/>→ 交锁+挂起 = 答案"] --> N1["为什么必须锁内：<br/>①设计动机 ②API语义（释放monitor）③丢唤醒（检查+wait要原子）"]
         N1 --> N2["条件检查必须 while：<br/>假唤醒 + 竞争 + 恢复点在 wait 之后"]
         N2 --> N3["notify vs notifyAll：两类等待者共存<br/>→ notify 唤醒错的线程 → 挂死"]
-        N1 --> N4["ObjectMonitor 两队列：<br/>_WaitSet 等条件 / _EntryList 等锁<br/>notify 只是移队，还要重抢锁"]
+        N1 -->|"等条件 vs 等锁是两回事 → 队列也得分开"| N4["_WaitSet 等条件 / _EntryList 等锁<br/>notify 只是移队，被唤醒者还要重抢锁"]
+        N4 -->|"抢锁失败者要记名，但用锁保护等锁队列是自举悖论<br/>→ 入队只能无锁 CAS 头插 ⇒ LIFO 栈"| N4B["_cxq 投递口<br/>无锁 CAS 头插，LIFO"]
+        N4B -->|"LIFO 会饿死先到的 → 必须重排<br/>只有持锁者有权改队列 ⇒ owner 在 exit() 搬家"| N4C["_EntryList 重排台<br/>owner 独占，双向链表"]
     end
 
     WAIT -->|"wait 依赖锁、信号不保存 → 另一条路线"| P0["LockSupport：任意位置可调<br/>permit 0/1 槽"]
@@ -100,6 +102,8 @@ flowchart LR
   │      与"别人能判断你进没进临界区"物理互斥
   ├─ 演进：撤销贵 + 收益小 + 硬件 CAS 变便宜 → JDK15 默认禁用、JDK18 移除
   │    → JDK8 是四态升级，JDK17 是三态（无偏向锁）
+  ├─ 膨胀之后：monitor 内部怎么排队？（_cxq / _EntryList / _WaitSet 三队列）
+  │    → **归链③（02-03 §3）**，那里是唯一讲解处。本篇只讲锁的状态机
   └─ JIT 层再优化：锁消除（逃逸分析发现对象不逃逸）/ 锁粗化（连续加解锁合并）
 ```
 
@@ -121,11 +125,20 @@ flowchart LR
   ├─ 为什么多生产者多消费者用 notifyAll：
   │    两类等待者（等不满的生产者 + 等不空的消费者）共存同一 WaitSet
   │    → notify 可能唤醒错线程 → 它重查后睡回去 → 真正能改状态的人还睡着 → 挂死
-  └─ 机制：ObjectMonitor 两个队列——_WaitSet（等条件）/ _EntryList（等锁）
-       notify 只是"移队"（WaitSet → EntryList），被唤醒线程要重抢锁才能从 wait() 返回
+  └─ 机制：ObjectMonitor 三个队列——_WaitSet（等条件）/ _EntryList（等锁）/ _cxq（投递口）
+       ① 等条件 vs 等锁是两回事 → 队列也得分开
+       ② 抢锁失败者要"记名"，但用锁保护"等锁队列"是自举悖论（谁保护那把锁？）
+          → 入队必须无锁 → 无锁单链表上头插最便宜 → _cxq 是 LIFO 栈
+       ③ LIFO 会饿死先到的 → 得有人重排；只有持锁者有权改队列
+          → owner 在 exit() 把 _cxq 搬进 _EntryList（双向链表）顺手重排
+       ④ _WaitSet 却能上真锁（_WaitSetLock）：写它的人刚 wait 完、要睡很久
+          → 成本预算不同 ⇒ 允许的同步手段不同
+       ⚠️ 常见错误修正：被唤醒 ≠ 成为 _owner。唤醒只给"重新竞争的资格"，
+          还要 CAS 赢一次 → 这就是 synchronized 非公平（barging）的来源；
+          _succ（内定继任者）用于抑制"醒了一群、只跑一个"的无效唤醒
 ```
 
-- 测试：`sync/ProducerConsumerTest`（2 生产者 + 3 消费者，刻意改 if/notify 观察 bug）、`sync/WaitVsSleepTest`（wait 释放锁 / sleep 不释放）
+- 测试：`sync/ProducerConsumerTest`（2 生产者 + 3 消费者，刻意改 if/notify 观察 bug）、`sync/WaitVsSleepTest`（wait 释放锁 / sleep 不释放）、`sync/MonitorQueueStateTest`（三队列 ↔ 三线程状态：BLOCKED/WAITING，验证 notify 只移队不给锁 + barging 观察）
 
 ### 链④ 协作原语升级：LockSupport（02-04）
 

@@ -239,9 +239,9 @@
 | 2.3.5 | 偏向锁延迟（BiasedLockingStartupDelay，默认 4 秒） | ◈◈ | 知道 JVM 启动时偏向锁不立即生效 |
 | 2.3.6 | JDK 15 默认禁用偏向锁、JDK 21 彻底废弃 | ◈◈ | 现代 JVM 趋势 |
 | 2.3.7 | 轻量级锁获取（CAS 竞争 Lock Record 指针） | ⭐⭐⭐ | 自旋等待 |
-| 2.3.8 | 轻量级锁膨胀为重量级锁的条件（自旋超限 / 等待队列出现） | ⭐⭐⭐ | 竞争加剧时升级 |
+| 2.3.8 | 轻量级锁膨胀为重量级锁的条件（检测到竞争即膨胀，**不是**自旋超限） | ⭐⭐⭐ | 竞争加剧时升级 |
 | 2.3.9 | 自旋锁（Spin Lock）与自适应自旋（Adaptive Spinning） | ◈◈ | JDK 6 引入的优化 |
-| 2.3.10 | 重量级锁的 ObjectMonitor 结构：_owner / _WaitSet / _EntryList | ⭐⭐⭐ | wait/notify 的数据结构基础 |
+| 2.3.10 | 重量级锁的 ObjectMonitor 结构：_owner / _cxq / _EntryList / _WaitSet / _succ | ⭐⭐⭐ | wait/notify 的数据结构基础 |
 
 ### 2.4 JIT 编译器对锁的优化
 
@@ -291,7 +291,7 @@
 |---|---|---|
 | `synchronizer.cpp` (HotSpot) | 偏向锁撤销、锁膨胀核心逻辑 | ◈◈ |
 | `markWord.hpp` (HotSpot) | Mark Word 位定义 | ◈◈ |
-| `ObjectMonitor` (HotSpot) | _owner / _WaitSet / _EntryList | ◈◈ |
+| `ObjectMonitor` (HotSpot) | _owner / _cxq / _EntryList / _WaitSet / _succ | ◈◈ |
 | `Object.java` (JDK) | wait/notify/notifyAll 的 native 声明 | ⭐⭐⭐ |
 
 ### 🧪 阶段二必做练习

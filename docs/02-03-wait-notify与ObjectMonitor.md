@@ -11,7 +11,7 @@
 | 标记 | 知识点 | 策略 |
 |---|---|---|
 | 🛠️ ⭐⭐⭐ | wait/notify 正确范式（while + 条件检查）、wait 释放锁、notify vs notifyAll、假唤醒的防御 | **深入理解 + 能手写正确代码** |
-| ◈◈ | ObjectMonitor 的 _WaitSet/_EntryList 流转、假唤醒的四层产生机制、wait(timeout) 超时语义、生产者-消费者两种实现 | **知道原理 + 能画出流转图** |
+| ◈◈ | ObjectMonitor 的三个队列（`_cxq` / `_EntryList` / `_WaitSet`）各管什么、假唤醒的四层产生机制、wait(timeout) 超时语义、生产者-消费者两种实现 | **知道原理 + 能画出流转图** |
 | ○ | wait 的 Javadoc 原文 | **知道概念即可** |
 | ○ | LockSupport park/unpark 的 permit 机制 | 见 [02-04-LockSupport与park机制](./02-04-LockSupport与park机制.md) |
 
@@ -34,7 +34,7 @@ Object.notifyAll()   唤醒 WaitSet 中所有线程
 调用 wait() 的线程状态：WAITING（或 TIMED_WAITING）
 
 线程状态流转：
-  RUNNABLE → WAITING（调用 wait()）→ 被唤醒 → BLOCKED（回 EntryList 抢锁）→ RUNNABLE（抢到锁）
+  RUNNABLE → WAITING（调用 wait()）→ 被唤醒 → BLOCKED（回 _EntryList 重新抢锁）→ RUNNABLE（抢到锁）
 ```
 
 ---
@@ -62,9 +62,10 @@ Object.notifyAll()   唤醒 WaitSet 中所有线程
      条件仍不满足 → 继续 wait
    → notify 的义务归属：谁改了共享状态、可能让别的等待者条件满足，谁调
      （生产者 add 后 notify 消费者；消费者 poll 后也要 notify 生产者）
-   → 两个队列由此而生（详见第 3 节）：
-     EntryList：等锁的人（BLOCKED）     WaitSet：等条件的人（WAITING）
-     notify 干的事只是"移队"：WaitSet → EntryList → 抢锁 → 重查条件
+   → 三个队列由此而生（详见第 3 节）：
+     _cxq：抢锁失败的人（BLOCKED，投递口）   _EntryList：被挑中、待进入的人（BLOCKED，重排台）
+     _WaitSet：等条件的人（WAITING）
+     notify 干的事只是"移队"：_WaitSet → _EntryList → 抢锁 → 重查条件
 ⑥ 原子性闭环：检查条件、wait、改状态、notify 全在同一把锁内
    → 谁也没法插队 → 不丢唤醒 → 整个协议自洽
 ```
@@ -125,6 +126,9 @@ wait/notify = "临界区内等条件"这个普遍需求，在管程模型下的�
     执行完 / 抛异常 —— 永久放弃 monitor
     wait()           —— 暂时放弃 monitor，之后还能回来抢锁
 → wait() 就是为"临界区内交锁"专门设计的唯一原语
+
+（这两条出路的**代码位置视角**——为什么 wait 不是"出口"而只是一次普通方法调用
+ —— 见 §3.4，那里是理解 while 必要性的机制根源）
 ```
 
 **第二层（API 语义）：wait() 的定义就是"释放 monitor"，所以必须先持有锁**
@@ -169,54 +173,154 @@ if (!queue.isEmpty()) {               queue.add(item);
 
 ---
 
-## 3. ObjectMonitor 中的两个队列
+## 3. ObjectMonitor：三个队列
 
-### 3.1 结构图
+> 本节是**「ObjectMonitor 内部长什么样」的唯一讲解处**。锁的状态机（Mark Word / 锁升级）在 [02-02](./02-02-对象头与锁升级全链路.md)，这里只管「等锁的人和等条件的人分别待在哪」。
+
+### 3.1 结构
 
 ```
-ObjectMonitor：
-┌─────────────────────────────────────────────┐
-│  _owner（当前持有锁的线程）                    │
-│  _recursions（重入计数）                      │
-│                                             │
-│  _EntryList：等待获取锁的线程队列               │
-│    [Thread1] → [Thread2] → [Thread3]        │
-│                                             │
-│  _WaitSet：调用了 wait() 的线程队列             │
-│    [ThreadA] → [ThreadB]                    │
-└─────────────────────────────────────────────┘
+ObjectMonitor（HotSpot 内部结构，JDK 8~21 骨架一致）：
+┌────────────────────────────────┐
+│ _owner: Thread*                │ ← 持有锁的线程（NULL = 无人持有）
+│ _recursions: int               │ ← 重入计数
+│ _cxq: ObjectWaiter*            │ ← 竞争队列（投递口）：抢锁失败的线程在这里 CAS 头插（LIFO 栈）
+│ _EntryList: ObjectWaiter*      │ ← 待唤醒队列（重排台）：owner 从这里挑继任者（双向链表）
+│ _WaitSet: ObjectWaiter*        │ ← 等待集（候车室）：调了 wait() 等条件的线程（双向循环链表）
+│ _succ: Thread*                 │ ← 内定的"继任者"，owner 退出前指定
+│ _contentions / _count: int     │ ← 活跃竞争数 / 引用计数
+│ _WaitSetLock                   │ ← 只保护 _WaitSet 的短自旋锁（cxq 不用锁！）
+└────────────────────────────────┘
 ```
 
-### 3.2 线程流转图
+> 字段定义在 `objectMonitor.hpp`，全部逻辑在同目录 `objectMonitor.cpp` 的
+> `enter()` / `EnterI()` / `exit()` / `TrySpin()` / `AddWaiter()` 里。
+> 几个字段的源码注释（原文，以你手上的 hpp 为准）：
+> `_cxq` = *LL of recently-arrived threads blocked on entry.*；
+> `_EntryList` = *Threads blocked on entry or reentry.*；
+> `_WaitSet` = *LL of threads wait()ing on the monitor*；
+> `_succ` = *Heir presumptive thread - used for futile wakeup throttling*。
+
+**三个队列不是冗余，是分工**：
+
+| | `_cxq`<br>**竞争队列**（投递口） | `_EntryList`<br>**待唤醒队列**（重排台） | `_WaitSet`<br>**等待集**（候车室） |
+|---|---|---|---|
+| 谁写 | 任何抢锁失败的线程 | **只有 owner** | 调了 `wait()` 的线程 |
+| 同步手段 | 无锁 CAS | 不需要（owner 独占） | `_WaitSetLock` 短自旋锁 |
+| 结构 | 单向链表（栈，LIFO） | 双向链表 | 双向循环链表 |
+| 语义 | 抢锁失败、未被挑中 | 已被挑中 / 待唤醒 | 等**条件**（wait） |
+| 写入者的时间预算 | "下一秒可能就拿到锁" | — | 已经决定要睡很久 |
+| 存在理由 | 入队必须无锁 ⇒ 只能是栈 | 出队需要有序 | 条件等待语义不同 |
+
+> 📌 **三个中文名的选词有讲究**：
+> - **`_cxq` = 竞争队列**：HotSpot 注释里 *contention queue* 的直译。叫「投递口」是因为**谁来了都先塞这儿**
+> - **`_EntryList` = 待唤醒队列**：**故意不叫"入口队列"**——新线程其实先进 `_cxq`，叫"入口"会直接把人带偏（本文档旧版就踩过这个坑）。它是 owner **从 `_cxq` 里挑出继任者之后**待的地方，等的是"被 unpark"
+> - **`_WaitSet` = 等待集**：JLS 里 *wait set* 的标准中文译法（同义说法「等待集合」）。它和锁无关，等的是**条件**
+
+### 3.2 为什么是三个队列？（因果链）
+
+**根问题**：一次只有一个线程能持有锁，抢不到的线程得"记个名"等下次机会。记在哪？
+
+**关键矛盾**：记名这个动作由**失败者自己**做，而且多个失败者会**同时**做。若用"队列 + 一把内部锁"保护，就撞上**自举悖论**——你用一把锁去保护"大家排队等着拿的那把锁"的队列，谁来保护这把锁？
+
+```
+自举悖论（为什么 cxq 不能用锁保护）
+  ↓
+入队必须无锁 → 只能 CAS
+  ↓
+无锁单链表上，头插最便宜（一次 cmpxchg）
+尾插要 CAS 尾指针 + 处理中断/ABA，复杂度陡增
+  ↓
+头插 ⇒ _cxq 是 LIFO 栈
+  ↓
+新问题：LIFO 对锁是灾难 —— 最后到的先拿到锁，先到的被持续插队 → 饿死
+  ↓
+需要有人把顺序重排回来。谁有资格？只有持有锁的线程
+（它是唯一有权改锁状态的人，且临界区内天然单线程）
+  ↓
+于是 owner 在 exit() 时做一次"搬家"：_cxq → _EntryList，顺手重排
+_EntryList 用双向链表，因为只有一个操作者，负担得起
+```
+
+> 💡 **顺带回答一个隐藏问题**：为什么 `_WaitSet` 就能用真锁（`_WaitSetLock`）？
+> 因为写它的线程刚调完 `wait()`、下一秒就要 park 睡很久，多花几十纳秒无所谓；
+> 而写 `_cxq` 的线程是"owner 随时可能 release，我下一秒就可能拿到锁"，
+> 这里多花的每一纳秒都直接变成延迟。**成本预算不同 ⇒ 允许的同步手段不同。**
+> 这不是"哪个结构更先进"，是"谁在用、用得多急"。
+
+### 3.3 一个线程的完整轨迹
+
+**线程流转图**（⚠️ 注意新线程的落脚点）：
 
 ```
                     ┌──────────────┐
                     │  新线程进入   │
                     └──────┬───────┘
                            ▼
-                 ┌─────────────────┐
-                 │  _EntryList     │  等待获取锁
-                 └────────┬────────┘
-                          ▼ 抢到锁
-                 ┌─────────────────┐
-                 │  执行临界区代码   │
-                 └──┬───────┬──────┘
-                    │       │
-        调用 wait()  │       │ 执行完毕
-                    ▼       ▼
-           ┌─────────────┐  ┌──────────────┐
-           │ _WaitSet    │  │ 释放锁，退出  │
-           │ 等待被唤醒   │  └──────────────┘
-           └──────┬──────┘
-                  │ notify() / notifyAll()
-                  ▼
-           ┌─────────────────┐
-           │ 回到 _EntryList  │  ← 注意：不是直接执行！
-           │ 重新排队抢锁      │     要先抢到锁才能从 wait() 返回
-           └─────────────────┘
+              ┌────────────────────────┐
+              │  TryLock CAS _owner    │──成功──▶ 直接执行临界区（不碰任何队列）
+              └────────┬───────────────┘
+                       │ 失败
+                       ▼
+              ┌────────────────────────┐
+              │  TrySpin 自适应自旋     │──抢到──▶ 直接执行临界区
+              └────────┬───────────────┘
+                       │ 仍失败
+                       ▼
+              ┌────────────────────────┐
+              │  _cxq（投递口，LIFO）   │  ← 新线程先到这里，不是 _EntryList！
+              └────────┬───────────────┘
+                       │ owner 退出时挑人
+                       ▼
+              ┌────────────────────────┐
+              │  _EntryList（重排台）   │  等 owner 挑中并 unpark
+              └────────┬───────────────┘
+                       ▼ 被唤醒后【重新 CAS 竞争】，赢了才算数
+              ┌────────────────────────┐
+              │  执行临界区代码         │
+              └──┬──────────────────┬──┘
+                 │                  │
+     调用 wait() │                  │ 执行完毕
+                 ▼                  ▼
+        ┌─────────────┐    ┌──────────────┐
+        │ _WaitSet    │    │ 释放锁，退出  │
+        │ 等待被唤醒   │    └──────────────┘
+        └──────┬──────┘
+               │ notify() / notifyAll()
+               ▼
+        ┌─────────────────┐
+        │ 回到 _EntryList  │  ← 注意：不是直接执行！
+        │ 重新排队抢锁      │     要先抢到锁才能从 wait() 返回
+        └─────────────────┘
 ```
 
-### 3.3 关键点
+**同一件事的时序视角**：
+
+```
+T: synchronized(obj)
+   ├─ TryLock  CAS(_owner, NULL → T) ──成功──▶ 直接成为 owner（压根没碰任何队列）
+   │                                           已是 owner → _recursions++
+   ├─ 失败 → TrySpin 自适应自旋              ← 目的是省掉一次 park/unpark（1~10μs）
+   │                                          （_succ 被指定时，其他线程会提前放弃自旋）
+   └─ 仍失败 → EnterI：
+         ① new ObjectWaiter，CAS 头插进 _cxq     ← LIFO
+         ② 循环里继续 TryLock（在 cxq 里也能截胡），拿不到才 park()
+        ⚠ cxq 是投递口，不是终点站
+
+owner exit():
+   _recursions--；若仍 > 0 直接返回（重入）
+   否则：挑继任者 w → 置 _succ = w._thread → unpark(w)   ← 不是把锁"交给"它
+
+T 被唤醒 ──▶ 回到 TryLock 重新 CAS 竞争
+             ├─ 抢到 → 成为 owner，把自己从 cxq/_EntryList 摘掉
+             └─ 没抢到（被刚到的线程 barge 截胡）→ 回去继续 park
+
+wait()/notify() 走的是另一条线：
+   owner：wait()    → 自己入 _WaitSet + 释放锁 + park
+   其他：notify()   → 从 _WaitSet 摘一个 → 移进 _EntryList → 它还得重新抢锁
+```
+
+**关键点**：
 
 ```
 1. notify() 只是"移队"，不是"直接唤醒执行"
@@ -224,7 +328,9 @@ ObjectMonitor：
 
 2. 被唤醒的线程抢到锁后，从 wait() 返回，继续执行 wait() 之后的代码
 
-3. 两个队列互不干扰：EntryList 是抢锁的，WaitSet 是等通知的
+3. 队列分工：_cxq 是投递口（谁来都先塞这）、_EntryList 是 owner 的重排台、
+   _WaitSet 是等条件的候车室。三者不是"三个并列的等待区"，
+   而是一个线程在生命周期里经过的三个位置
 
 4. wait 释放锁的意义：不给别人释放，别人无法进入临界区去 notify
 ```
@@ -261,11 +367,12 @@ synchronized 块只有两个出口：执行完 / 抛异常。wait() 不是出口
 
 ```
 wait() 内部：
-  1. 释放 monitor，把自己加进 WaitSet
+  1. 释放 monitor，把自己加进 _WaitSet
   2. park（线程挂起，PC 保留在调用 wait() 的栈帧上）
 
 被 notify 后：
-  3. 移回 EntryList，参与抢锁（monitor enter）
+  3. 移回 _EntryList，参与抢锁（monitor enter）
+     ⚠️ 注意是【重新竞争】，不是直接拿到——详见 §3.5「错误说法 1」
   4. 抢到锁 → unpark → park 返回 → wait() 返回
   5. JVM 从栈帧取出返回地址 → 继续执行下一条字节码
 ```
@@ -278,6 +385,56 @@ wait() 内部：
   用 while：while (isEmpty()) { wait(); } 后面是回到循环条件 → 先重查 ✅
 → "从 wait() 返回处继续"正是 while 循环必要性的机制根源（详见 4.2）
 ```
+
+### 3.5 两个常见错误说法
+
+> ⚠️ **错误说法 1：「被唤醒后就直接变成 `_owner`」**
+> **错**。被唤醒只是获得**重新竞争的资格**，还要 CAS 赢一次。这正是 `synchronized` **非公平**的根源：刚到的线程可以直接插队（barging），被唤醒的线程可能白醒一场，回去接着 park。
+> HotSpot 用 `_succ` 缓解——它是 owner 指定的"内定继任者"（源码注释：*used for futile wakeup throttling*，抑制无效唤醒）：继任者已内定时，其他线程少自旋、早点去 park，避免"醒了一群、只跑一个"。
+
+> ⚠️ **错误说法 2：「`_owner = null` → 唤醒一个线程」**
+> **不完整**。`exit()` 里 owner 还要短暂地**重新 `TryLock`** 才能安全改队列（改队列需要 owner 身份），挑完继任者才真正放手。
+
+> 📌 **`_cxq → _EntryList` 的搬法是有开关的**：HotSpot 用 `Knob_QMode` 控制
+> （`-XX:+UnlockDiagnosticVMOptions -XX:QMode=N`，0/1/2/3 对应不同的
+> "谁优先 / 头插还是尾插 / 搬不搬"策略）。本文**不写死**默认走哪条——
+> 要进结论，就打开 `objectMonitor.cpp` 的 `exit()` 逐行确认。
+> 骨架记住即可：**`_cxq` 是投递口，`_EntryList` 是 owner 的重排台。**
+
+### 3.6 验证：三个队列能被 `Thread.getState()` 看见
+
+> 代码：`src/test/java/com/sw/yang/concurrent/sync/MonitorQueueStateTest.java`
+
+JDK 里「队列 ↔ 线程状态」是**文档化**的对应关系，不是巧合：
+
+| 队列 | `Thread.State` | 为什么是这个状态 |
+|---|---|---|
+| `_cxq` / `_EntryList` | `BLOCKED` | `ObjectMonitor::enter` 里 `JavaThreadBlockedOnMonitorEnterState` 会把线程状态置为 BLOCKED 再 park |
+| `_WaitSet` | `WAITING` / `TIMED_WAITING` | 调 `wait()` / `wait(ms)` 后 park，等的是**条件**不是锁 |
+
+四段验证：
+
+1. **`testContentionIsBlocked`** —— 抢锁失败者 = `BLOCKED`（在 `_cxq`/`_EntryList` 里）
+2. **`testWaitIsWaiting`** —— 调了 `wait()` 者 = `WAITING`（在 `_WaitSet` 里）
+3. **`testNotifyOnlyMovesQueue`** —— 核心。`notify()` 只是"移队"，**不是"给锁"**：通知者仍持锁期间，被唤醒线程**不可能**越过 `wait()` 的返回点
+4. **`testBargingObservation`** —— 非确定性观察（只打印不断言）：通知者退出临界区后立刻重新抢锁，被唤醒的线程往往还在排队 → 这就是**非公平 / barging**
+
+> ⚠️ 第 3 条的断言写法有讲究：**不断言"被唤醒后是 BLOCKED"**（`WAITING → BLOCKED` 的具体翻转时刻是实现细节，跨版本可能变），只断言**不变量**——"锁还被别人拿着时，它绝不可能从 `wait()` 返回"。这样测试不会因 JVM 实现细节而 flaky。
+
+**本机实测**（Temurin JDK 21，4 个用例 0.29s 全绿）：
+
+```
+✅ 抢锁失败（_cxq/_EntryList）→ BLOCKED
+✅ 调了 wait()（_WaitSet）→ WAITING
+notify() 之后、main 仍持锁时，waiter = BLOCKED（= 已在 _EntryList 里重新抢锁）
+✅ main 退出临界区后，waiter 才真正从 wait() 返回
+
+=== barging 观察（100 轮）===
+通知者退出后立刻插队成功：100 次
+waiter 先抢到：0 次
+```
+
+> 📌 100/100 值得琢磨：**通知者从没下过 CPU**，而被唤醒者要走 unpark → 等调度 → 上 CPU 一整条路，所以次次插队成功。这不是"JVM 实现得不好"，是**非公平锁的必然**——公平要额外代价（AQS 的 `hasQueuedPredecessors` 就是为它付的账，见 03-01）。
 
 ---
 
@@ -363,7 +520,7 @@ synchronized (lock) {
 **两条路径的汇合点**
 
 ```
-真唤醒：被 notify → 移 EntryList → 抢到锁 → unpark → park 返回 → wait() 返回
+真唤醒：被 notify → 移 _EntryList → 重新抢到锁 → unpark → park 返回 → wait() 返回
 假唤醒：park 无故返回（没有 unpark）→ permit 检查 → 假醒 → 再睡（或放行）
 
 wait() 返回前必须重新持有 monitor —— 两条路径都满足（见 3.4）
