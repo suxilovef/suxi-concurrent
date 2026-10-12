@@ -11,6 +11,8 @@ import java.util.concurrent.TimeUnit;
  * 练习 2：thenCompose 依赖编排
  *
  * 场景：查订单 → 用订单的 userId 查用户 → 用用户的 level 算折扣
+ *
+ * 等待点用 get(timeout)（可超时 + 可中断），不要用 join()（见 docs/04-03 §5.4）
  */
 public class ComposeChainTest {
 
@@ -68,7 +70,7 @@ public class ComposeChainTest {
     }
 
     @Test
-    public void testDependentChain() throws InterruptedException {
+    public void testDependentChain() throws Exception {
         long start = System.currentTimeMillis();
 
         CompletableFuture<Double> discountF =
@@ -78,8 +80,9 @@ public class ComposeChainTest {
                 .thenCompose(user ->                                                  // ③ 依赖用户
                         CompletableFuture.supplyAsync(() -> calcDiscount(user), executor));
 
-        // ④ 最终结果
-        double discount = discountF.join();
+        // ④ 最终结果 —— 等待点，用 get(timeout)：可超时 + 可中断
+        //    不要用 join()：不可中断、也没有超时重载（见 docs/04-03 §5.4）
+        double discount = discountF.get(1000, TimeUnit.MILLISECONDS);
         long elapsed = System.currentTimeMillis() - start;
 
         System.out.println("最终折扣: " + discount);

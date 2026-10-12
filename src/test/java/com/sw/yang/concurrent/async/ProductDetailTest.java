@@ -14,6 +14,9 @@ import java.util.concurrent.TimeUnit;
  * 目标：
  * 1. 理解 allOf 的使用
  * 2. 验证总耗时 ≈ 最慢任务（并行效果）
+ * 3. 分清"等待点"和"读取点"：等待点必须 get(timeout)（可超时 + 可中断），
+ *    读取点才用 join()（已完成 → fast path，免检是白拿的）
+ *    对应 docs/04-03 §5.4
  */
 public class ProductDetailTest {
 
@@ -122,7 +125,7 @@ public class ProductDetailTest {
      * 并行版：总耗时 = 最慢任务 = 500ms
      */
     @Test
-    public void parallelVersion() throws InterruptedException {
+    public void parallelVersion() throws Exception {
         ThreadPoolExecutor executor = buildExecutor();
         long start = System.currentTimeMillis();
 
@@ -135,10 +138,12 @@ public class ProductDetailTest {
         CompletableFuture<List<Review>> reviewF =
                 CompletableFuture.supplyAsync(() -> queryReviews(1L), executor);
 
-        // 等全部完成
-        CompletableFuture.allOf(productF, stockF, priceF, reviewF).join();
+        // 唯一的真等待点：get(timeout) —— 可超时 + 可中断
+        // 不要用 join()：join 不可中断、也没有超时重载（见 docs/04-03 §5.4）
+        CompletableFuture.allOf(productF, stockF, priceF, reviewF)
+                .get(800, TimeUnit.MILLISECONDS);
 
-        // 组装（此时全部完成）
+        // 组装：此时全部已完成 → join 走 fast path（不进入等待分支，所以免检是白拿的）
         ProductDetail detail = new ProductDetail();
         detail.product = productF.join();
         detail.stock = stockF.join();

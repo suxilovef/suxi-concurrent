@@ -226,13 +226,13 @@ CompletableFuture<Stock> s = CompletableFuture.supplyAsync(() -> queryStock(id),
 CompletableFuture<Price> pr = CompletableFuture.supplyAsync(() -> queryPrice(id), executor);
 CompletableFuture<Reviews> rv = CompletableFuture.supplyAsync(() -> queryReviews(id), executor);
 
-// allOf 等待所有完成（注意：返回 CompletableFuture<Void>，拿不到结果！）
+// allOf 只负责"汇合"：它自己【以 null 完成】（不是没结果，结果就是 null）
 CompletableFuture<Void> all = CompletableFuture.allOf(p, s, pr, rv);
 
-// 等待全部完成
-all.join();
+// 等待全部完成 —— 用 get(timeout)，不要用 join()（原因见 5.4）
+all.get(800, TimeUnit.MILLISECONDS);
 
-// 各自 get 结果（此时都已完成，不会阻塞）
+// 结果从各个原始 future 里拿（此时都已完成，join 走 fast path 立即返回）
 Product product = p.join();
 Stock stock = s.join();
 ...
@@ -240,8 +240,11 @@ Stock stock = s.join();
 
 ```
 ⚠️ allOf 的坑：
-  返回的是 CompletableFuture<Void> —— 结果要自己从原来的 future 里拿！
-  正确姿势：allOf().join() 后，逐个 join() 原始 future
+  返回 CompletableFuture<Void> —— 它是"以 null 完成"的（不是没结果，结果就是 null）
+  正确姿势：allOf() 等待完成后，逐个从原始 future 拿值
+
+⚠️ 别用 allOf().join() 当等待点：
+  join 不可中断、也没有超时重载 → 任意一个任务 hang 住就永久占线程（见 5.4）
 ```
 
 ### 5.2 anyOf —— 任一完成即可
@@ -254,8 +257,8 @@ CompletableFuture<Object> first =
                 CompletableFuture.supplyAsync(() -> queryFromDB(), executor),
                 CompletableFuture.supplyAsync(() -> queryFromRemote(), executor));
 
-// 返回最先完成的那个的结果
-Object result = first.join();
+// 拿最先完成的那个的结果 —— 这同样是"等待点"，一样要 get(timeout)
+Object result = first.get(800, TimeUnit.MILLISECONDS);
 // 注意：返回类型是 Object（因为不知道哪个先完成）
 ```
 
@@ -263,11 +266,12 @@ Object result = first.join();
 
 ```java
 public class ProductDetailService {
+    /** 聚合总预算：超过就降级，绝不无限等 */
+    private static final long DETAIL_TIMEOUT_MS = 800;
+
     private final ThreadPoolExecutor executor = buildExecutor();
 
-    public ProductDetailVO getProductDetail(Long productId) {
-        long start = System.currentTimeMillis();
-
+    public ProductDetailVO getProductDetail(Long productId) throws InterruptedException {
         // ① 并发发起 4 个查询
         CompletableFuture<Product> productF =
                 CompletableFuture.supplyAsync(() -> productMapper.selectById(productId), executor);
@@ -278,10 +282,31 @@ public class ProductDetailService {
         CompletableFuture<List<Review>> reviewF =
                 CompletableFuture.supplyAsync(() -> reviewService.listReviews(productId), executor);
 
-        // ② 等所有完成
-        CompletableFuture.allOf(productF, stockF, priceF, reviewF).join();
+        // ② 唯一的"真等待"点 —— 必须 get(timeout)：可超时 + 可中断
+        //    ❌ 不要写 allOf(...).join()：join 不可中断、且没有超时重载（见 5.4）
+        try {
+            CompletableFuture.allOf(productF, stockF, priceF, reviewF)
+                    .get(DETAIL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            // 超时处置：这里选"快速失败"（想降级就改成返回兜底 VO）
+            // 先标记取消，让调用方不再被这组 future 绊住
+            // ⚠️ cancel(true) 只是把 future 置为"已取消"状态，
+            //    它【不会】中断正在跑的任务 —— 后台查询会继续跑完，只是结果被丢弃。
+            //    想真正中断，得让任务自己响应中断（见 04-02 优雅停机）
+            productF.cancel(true);
+            stockF.cancel(true);
+            priceF.cancel(true);
+            reviewF.cancel(true);
+            throw new IllegalStateException("商品详情聚合超时 " + DETAIL_TIMEOUT_MS + "ms", e);
+        } catch (ExecutionException e) {
+            // 4 个查询里有一个失败了 —— 原始异常在 cause 里
+            throw new IllegalStateException("商品详情聚合失败", e.getCause());
+        }
+        // InterruptedException 直接向上抛（中断位已被 get 清掉，调用方决定怎么处理）
 
-        // ③ 组装（此时全部完成，join 不阻塞）
+        // ③ 组装：走到这里 4 个 future 必然已完成 → result 字段非 null → 走 fast path，
+        //    压根不进入等待分支。所以这里的 join() 既不等、也用不上"可中断"，
+        //    只剩"不抛受检异常"这一个属性在起作用（见 5.4）
         return ProductDetailVO.builder()
                 .product(productF.join())
                 .stock(stockF.join())
@@ -291,6 +316,161 @@ public class ProductDetailService {
         // 总耗时 ≈ 最慢的那个查询（而不是 4 个之和！）
     }
 }
+```
+
+### 5.4 join() vs get()：为什么唯一的等待点必须是 get（⭐）
+
+两者源码几乎一模一样，只差**一个 boolean**（JDK 21 `CompletableFuture.java`）：
+
+```java
+// :2069
+public T get() throws InterruptedException, ExecutionException {
+    Object r;
+    if ((r = result) == null) r = waitingGet(true);    // ← true  = 可中断
+    return (T) reportGet(r);
+}
+
+// :2114
+public T join() {
+    Object r;
+    if ((r = result) == null) r = waitingGet(false);   // ← false = 不响应中断
+    return (T) reportJoin(r);
+}
+```
+
+这个 `interruptible` 一路传进 `Signaller`，在等待循环里决定"**被中断算不算等到**"：
+
+```
+get  → true  → 被 interrupt → isReleasable() 返回 true → 提前 return null
+             → reportGet(null) 抛 InterruptedException
+               （源码 :385 注释："by convention below, null means interrupted"）
+             → 中断必须能让调用者知道 → 只能是【受检】异常
+
+join → false → interrupted && interruptible 恒为 false
+             → 中断永远不解除阻塞，继续趴着等
+             → 没有"中断"这个结果要表达 → 只剩"任务自己失败了"
+             → 用非受检的 CompletionException 包（reportJoin 连 null 分支都没有）→【免检】
+```
+
+**因果结论：join 免检不是"设计随意"，而是它主动放弃了"可中断"这个语义。**
+所以"该用哪个"的判断标准不是"哪个简洁"，而是**你站在等待点上还是读取点上**：
+
+| | `get()` | `join()` |
+|---|---|---|
+| 受检异常 | `InterruptedException` + `ExecutionException` | 无（抛 `CompletionException`） |
+| 响应中断 | ✅ 抛 `InterruptedException` 并退出等待 | ❌ **不可中断**（继续等） |
+| 中断位 | 抛异常时已被清掉 | **被保留**（返回前重新置上，源码 :1904-1908） |
+| 超时 | ✅ `get(timeout, unit)` | ❌ **没有超时重载** |
+| 异常类型 | `ExecutionException`，cause 是原始异常 | `CompletionException`，cause 是原始异常 |
+
+```
+选择规则：
+
+  这是"等待点"（线程真的可能停在这里）
+      → 必须 get(timeout)
+      理由：不可中断 + 无超时 = 上游喊不停它（Future.cancel 无效）
+            下游一 hang 就永久占住线程 → 线程池/连接池连锁耗尽
+            （就是坑 2 那个坑，join 版本连补救的门都没有）
+
+  这是"读取点"（已经确定完成了）
+      → join() 更舒服
+      理由：result 字段非 null → 源码 if 判断直接跳过 waitingGet
+            → 不进入等待分支 → "可中断"本来就用不上
+            → 只剩"免检"这一个优势，白拿
+```
+
+⚠️ **别过度推论**：说 join"不可中断"，是指**中断不会让它退出等待**，不是"中断被吞掉"。
+源码 :1904-1908 会把中断位还给调用方 —— 实测：`join()` 被中断后既不抛异常也不返回，
+一直等到任务完成才返回，**返回时 `Thread.currentThread().isInterrupted()` 是 true**。
+所以"谁打断了我"这个信息没丢，丢的是"立刻停下来"这个能力。
+
+> 🔎 更精确的写法：意图是"我确定它完成了，读值"时，标准 API 是 `getNow(valueIfAbsent)` ——
+> 它和 `join()` 走同一条 `reportJoin` 路径（源码 :2134），但语义更准（未完成返回兜底值，而不是傻等）。
+> ⚠️ 注意 `getNow` 的兜底值只在**未完成**时生效；若任务已"以 null 完成"，返回的就是 null（见 5.5）。
+
+### 5.5 结果是 null 怎么办？（⚠️ 和"未完成"的区分）
+
+5.4 说"`waitingGet` 返回 null 表示被中断" —— 那如果**任务的结果本身就是 null**，不会撞车吗？
+不会。因为"值为 null"根本不用 null 表示，它用 **`NIL`** 表示：
+
+```java
+volatile Object result;   // :265  Either the result or boxed AltResult
+
+static final class AltResult {   // :286
+    final Throwable ex;          // null only for NIL
+    AltResult(Throwable x) { this.ex = x; }
+}
+static final AltResult NIL = new AltResult(null);   // :292 "The encoding of the null value"
+
+final boolean completeValue(T t) {                   // :305
+    return RESULT.compareAndSet(this, null, (t == null) ? NIL : t);
+}
+```
+
+**`result` 字段有四种状态，不是两种：**
+
+| `result` 的值 | 含义 |
+|---|---|
+| `null` | **未完成** |
+| `NIL`（`AltResult` 且 `ex == null`） | 已完成，**值就是 null** |
+| `AltResult` 且 `ex != null` | 异常完成 / 已取消 |
+| 其他对象 | 正常值 |
+
+于是两个"null"在编码层就分开了，`waitingGet` 的约定不会撞车：
+
+```java
+while ((r = result) == null) { ...阻塞... }   // :1883 循环只在 result != null 时退出
+...
+return r;                                      // :1910 拿到的永远非 null
+```
+
+整个方法只有两个 `return null`（:1879、:1894），**都在中断分支上**。所以：
+
+```
+waitingGet 返回 null  ⟺ 被中断（且 interruptible）
+waitingGet 返回 NIL   ⟺ 完成，值是 null      ← 非 null，走的另一条路
+```
+
+`reportGet` 再把这一个参数翻译成两种截然不同的结果，这是全篇最刁的一处：
+
+```java
+if (r == null) throw new InterruptedException();   // :385 原始 null = 被中断
+if (r instanceof AltResult) {
+    if (((AltResult)r).ex == null) return null;    // :390 NIL = 真正的 null 值
+}
+```
+
+**结论：`get()` 遇到"值为 null"的 future 是正常返回 null，不会抛 `InterruptedException`。**
+
+实测验证（JDK 21）：
+
+```
+[1]  supplyAsync(() -> null).get()          = null          ← 正常返回
+[2]  .join()                                = null
+[3]  isDone()                               = true
+[4]  isCompletedExceptionally()             = false         ← 不是异常完成
+[9]  未完成的 future.getNow("缺省")          = 缺省          ← 兜底生效
+[10] 已完成-null 的 getNow("缺省")           = null          ← 兜底【不】生效
+[6]  thenApply 返回 null → 下游              收到[null]      ← 链条继续
+[8]  thenCompose 返回 null CF →              CompletionException（NPE）
+[11] 阻塞在 get() 时被中断 →                  InterruptedException
+[13] join() 被中断后仍存活                    = true（还在等）
+[12] join() 返回[终于完成]，中断位             = true（被保留）
+```
+
+**三个实际影响：**
+
+```
+① getNow(valueIfAbsent) 的兜底值【不兜 null】
+   它的判断是 result == null（未完成），不是"值是不是 null"
+   → "以 null 完成"会原样返回 null，兜底失效。想兜 null 得自己判 isDone()
+
+② allOf 不是"没有结果"，而是"以 null 完成"（completeNull() → NIL）
+   → 这就是坑 5 里 all.join() 返回 null 的根因：那是正常的完成语义，不是缺失
+
+③ thenCompose 返回 null CompletableFuture 才是真坑 → NPE 被包成 CompletionException
+   而 thenApply 返回 null 完全安全（下游收到 null）
+   → 这是 thenApply / thenCompose 在"嵌套 vs 扁平化"之外的又一层差异
 ```
 
 ---
@@ -443,15 +623,18 @@ CompletableFuture.supplyAsync(() -> callHttp());
 CompletableFuture.supplyAsync(() -> queryDB(), bizExecutor);
 ```
 
-### 🕳️ 坑 2：get() 无限阻塞
+### 🕳️ 坑 2：无超时阻塞等待
 
 ```java
 // ❌ get() 没有超时 → 任务永远不完成 → 线程永久阻塞
 future.get();
 
-// ✅ 带超时
+// ❌❌ join() 更糟：不但无限阻塞，而且【不可中断】+【没有超时重载】
+CompletableFuture.allOf(f1, f2, f3).join();   // 生产事故高发写法
+
+// ✅ 带超时 + 可中断（唯一正确的等待点写法）
 future.get(3, TimeUnit.SECONDS);   // 3 秒超时抛 TimeoutException
-// 或 join() + 竞速兜底
+// 组合等待同理：allOf(...).get(800, TimeUnit.MILLISECONDS)
 ```
 
 ### 🕳️ 坑 3：在 thenApply 里做耗时操作
@@ -478,28 +661,34 @@ future.exceptionally(e -> { log.error("异步任务失败", e); return fallback(
 ### 🕳️ 坑 5：allOf 后直接拿结果
 
 ```java
-// ❌ allOf().join() 返回 null！不是所有结果
+// ❌ allOf() 返回 null！它是以 null 完成（结果就是 null，不是"没有结果"）
 CompletableFuture<Void> all = CompletableFuture.allOf(f1, f2);
-Object x = all.join();   // null！
+Object x = all.join();   // null！而且是不可中断的无限等待（根因见 5.5）
 
-// ✅ 必须从原始 future 拿
-all.join();
-Object r1 = f1.join();   // 此时已完成
+// ✅ 必须从原始 future 拿（等待点用 get(timeout)）
+all.get(800, TimeUnit.MILLISECONDS);
+Object r1 = f1.join();   // 此时已完成 → fast path
 Object r2 = f2.join();
 ```
 
-### 🕳️ 坑 6：join 抛 CompletionException
+### 🕳️ 坑 6：把 join() 当等待点用
 
 ```java
-// ⚠️ join() 抛的是 CompletionException（包装了原始异常）
-// get() 抛的是 ExecutionException
-// 处理：e.getCause() 拿原始异常
+// ⚠️ 异常类型不同：join 抛 CompletionException，get 抛 ExecutionException
+//    两者都用 e.getCause() 拿原始异常
 try {
     future.join();
 } catch (CompletionException e) {
     Throwable cause = e.getCause();   // 真正的异常
     log.error("异步任务失败: {}", cause.getMessage());
 }
+
+// ⚠️⚠️ 更致命的是 join 的另两个属性（不是异常类型，是能力缺失）：
+//    join() 不可中断  —— Future.cancel / 线程池 shutdownNow 喊不停它
+//    join() 无超时    —— 连 get(timeout) 那个门都没有，任务 hang 住就永久占线程
+//
+// ✅ 结论：站在"等待点"上必须用 get(timeout)；只有"读已完成的值"时才配用 join
+//    完整因果链（含 JDK 源码那个 interruptible 标志）见 5.4
 ```
 
 ---
@@ -520,6 +709,13 @@ try {
 
 5. **CompletableFuture 怎么实现超时？**
    → JDK 9+ 用 orTimeout/completeOnTimeout；JDK 8 用 anyOf 竞速 + 手动 complete 兜底。
+
+6. **join() 和 get() 的区别？**
+   → get 可中断 + 可超时（所以抛受检异常），join 不可中断且没有超时重载（所以免检）。源码上只差 `waitingGet(true/false)` 一个标志位。
+   → 判断标准：**等待点用 get(timeout)，读已完成的值才用 join**。生产里把 `allOf(...).join()` 当等待点用，是典型的不可中断 + 无超时隐患。
+
+7. **任务结果本身就是 null，get() 会不会抛 InterruptedException？**
+   → 不会。"完成值为 null"在 `result` 字段里存的是 `NIL`（`AltResult(null)`），不是 `null`；`null` 专门留给"未完成"。所以 `waitingGet` 那句 "null means interrupted" 不会撞车，`get()` 正常返回 null。详见 5.5。
 
 ---
 
@@ -594,7 +790,7 @@ public class ProductDetailTest {
      * 并行版：总耗时 = 最慢任务 = 500ms
      */
     @Test
-    public void parallelVersion() throws InterruptedException {
+    public void parallelVersion() throws Exception {
         ThreadPoolExecutor executor = buildExecutor();
         long start = System.currentTimeMillis();
 
@@ -607,10 +803,12 @@ public class ProductDetailTest {
         CompletableFuture<List<Review>> reviewF =
                 CompletableFuture.supplyAsync(() -> queryReviews(1L), executor);
 
-        // 等全部完成
-        CompletableFuture.allOf(productF, stockF, priceF, reviewF).join();
+        // 唯一的真等待点：get(timeout) —— 可超时 + 可中断
+        // 不要用 join()：join 不可中断、也没有超时重载（见 5.4）
+        CompletableFuture.allOf(productF, stockF, priceF, reviewF)
+                .get(800, TimeUnit.MILLISECONDS);
 
-        // 组装（此时全部完成）
+        // 组装：此时全部已完成 → join 走 fast path（不进入等待分支，所以免检是白拿的）
         ProductDetail detail = new ProductDetail();
         detail.product = productF.join();
         detail.stock = stockF.join();
@@ -675,7 +873,7 @@ public class ComposeChainTest {
     }
 
     @Test
-    public void testDependentChain() throws InterruptedException {
+    public void testDependentChain() throws Exception {
         long start = System.currentTimeMillis();
 
         CompletableFuture<Double> discountF =
@@ -685,8 +883,9 @@ public class ComposeChainTest {
                 .thenCompose(user ->                                                  // ③ 依赖用户
                         CompletableFuture.supplyAsync(() -> calcDiscount(user), executor));
 
-        // ④ 最终结果
-        double discount = discountF.join();
+        // ④ 最终结果 —— 等待点，用 get(timeout)：可超时 + 可中断
+        //    不要用 join()：不可中断、也没有超时重载（见 5.4）
+        double discount = discountF.get(1000, TimeUnit.MILLISECONDS);
         long elapsed = System.currentTimeMillis() - start;
 
         System.out.println("最终折扣: " + discount);
@@ -800,19 +999,34 @@ public class TimeoutFallbackTest {
 3. **allOf 返回什么？怎么拿结果？**
    <details><summary>答案</summary>
 
-   返回 CompletableFuture<Void>（没有结果）。先 allOf().join() 等待全部完成，再从各个原始 future 逐个 join() 拿结果（此时已完成不阻塞）。
+   返回 CompletableFuture<Void>（只负责汇合，不携带结果）。等待点用 `allOf(...).get(timeout, unit)`（可超时 + 可中断），完成后从各个原始 future 逐个 `join()` 拿值（此时已完成，走 fast path 不阻塞）。
    </details>
 
-4. **异常在链上怎么传播？exceptionally 和 handle 的区别？**
+4. **为什么等待点用 get(timeout) 而不是 join()？**
+   <details><summary>答案</summary>
+
+   源码上两者只差一个 boolean：`get()` → `waitingGet(true)`，`join()` → `waitingGet(false)`。这个 `interruptible` 标志决定"被中断算不算等到"，于是 join 主动放弃了可中断语义，代价是不可中断 + 没有超时重载 —— 任务 hang 住就永久占线程，且 `cancel`/`shutdownNow` 喊不停它。
+   所以"读已完成的值"才配用 join：那时 result 字段非 null，源码直接跳过等待分支，可中断能力本来就用不上，只剩免检这一个优势。
+   </details>
+
+5. **异常在链上怎么传播？exceptionally 和 handle 的区别？**
    <details><summary>答案</summary>
 
    异常沿链跳过所有中间环节直达最近的处理器。exceptionally 仅异常时触发（返回恢复值）；handle 正常/异常都触发（可判断 e 是否为空分别处理）。
    </details>
 
-5. **怎么实现超时降级？**
+6. **怎么实现超时降级？**
    <details><summary>答案</summary>
 
    JDK 9+：orTimeout() / completeOnTimeout()；JDK 8：anyOf 竞速 + 手动 complete 兜底（定时任务 3 秒后 complete("降级")）。
+   </details>
+
+7. **任务结果本身是 null，和"未完成"怎么区分？`getNow(x)` 会返回 x 吗？**
+   <details><summary>答案</summary>
+
+   编码层区分：`result == null` 表示未完成；"值为 null"被装箱成 `NIL`（`AltResult(null)`），所以 `get()` 正常返回 null，不会抛 `InterruptedException`。
+   `getNow(x)` 的判断是"未完成才返回 x"，所以"以 null 完成"会返回 null，兜底值不生效。
+   另外 `allOf(...).join()` 返回 null 不是"没结果"，而是它**以 null 完成**。
    </details>
 
 ---
