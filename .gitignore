@@ -34,3 +34,6 @@ build/
 
 ### mermaid 导出临时文件（本机浏览器配置，不入库） ###
 .tmp-mermaid/
+
+### 05-05 故障排查实验室的本地运行产物（日志、jstack dump，不入库） ###
+.tmp-lab/

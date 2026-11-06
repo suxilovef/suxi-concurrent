@@ -39,6 +39,9 @@ public class WatchdogTest {
             // ⚠️ 教学简化：这里只判断 TTL > 0 就续期（单线程演示没问题）
             //    真实实现必须校验 value —— 否则锁被别人抢走后会把别人的锁续期！
             //    （Redisson 用 Lua 校验 hash 中的 threadId 再续期）
+            // ⚠️ 看门狗是独立线程：业务线程结束、甚至异常退出，它都不会自动停，
+            //    只能靠下面的 running.set(false) 显式取消（真实 Redisson 在 unlock 里 cancel，
+            //    详见 docs/06-01-Redis分布式锁.md §3.2 第三层）
             AtomicBoolean running = new AtomicBoolean(true);
             ScheduledExecutorService watchdog = Executors.newSingleThreadScheduledExecutor();
             watchdog.scheduleAtFixedRate(() -> {

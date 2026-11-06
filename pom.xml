@@ -35,6 +35,14 @@
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
 
+        <!-- Actuator：docs/05-05 故障排查实操用（/actuator/threaddump = 网页版 jstack，
+             /actuator/heapdump 直接下堆转储）。注意默认只暴露 health，
+             要看 threaddump 需启动时显式打开 [management.endpoints.web.exposure.include] -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>

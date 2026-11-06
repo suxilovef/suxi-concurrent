@@ -1,0 +1,6 @@
+# 构建上下文是服务器上的 ~/lab/（只含 app.jar / Dockerfile / docker-compose.yml）
+# 唯一要排掉的是日志目录 —— 否则每次 rebuild 都会把上千行 app.log 打进上下文。
+logs/
+dumps/
+*.log
+app.pid

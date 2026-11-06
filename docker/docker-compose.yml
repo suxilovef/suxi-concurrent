@@ -1,0 +1,59 @@
+# 生产故障排查实验室 · 第二幕编排（对应 docs/05-05 第 4 节）
+#
+# 部署到服务器 ~/lab/ 下运行（lab.sh build 会把 app.jar / Dockerfile / 本文件一起传上去），
+# 所以 build.context 是 "."。
+#
+# 用法：
+#   docker compose -f docker-compose.yml build --network=host
+#   docker compose -f docker-compose.yml up -d
+#   docker compose -f docker-compose.yml down -t 5
+# 或者直接用：bash scripts/lab/lab.sh docker-up | docker-down | pidns
+
+services:
+  lab:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # 构建期让 RUN 走宿主网络：镜像里那句 apt-get install procps 要访问
+      # mirrors.tencentyun.com，而它解析到 169.254.0.3（link-local）——
+      # 容器默认桥接网络够不到，必须借宿主网络。
+      # 注：写在这里而不是命令行 --network，因为 `docker compose build --network` 不存在。
+      network: host
+    image: concurrent-lab:jdk17
+    container_name: lab
+
+    # ---------------------------------------------------------------------
+    # 资源限额 —— 这不是"顺手加的限制"，是让行为变"生产"的关键
+    #
+    # --cpus=2  → cgroup cpu.max → availableProcessors()=2
+    #             Tomcat 线程池、ForkJoinPool.commonPool 都按 2 核收敛
+    # --memory=1500m → cgroup 内存限额 → JDK 10+ 容器感知生效，
+    #             max heap = 25% × 1500m ≈ 375MB
+    #
+    # 不限额的话 JVM 会读宿主的 3.6G，给自己 ~900MB —— GC 问题被掩盖，
+    # dashboard / jstat 的数字都失真。
+    # ---------------------------------------------------------------------
+    cpus: 2
+    mem_limit: 1500m
+    memswap_limit: 1500m
+
+    # Arthas / jstack attach 目标 JVM 需要 ptrace 权限
+    cap_add:
+      - SYS_PTRACE
+
+    # ---------------------------------------------------------------------
+    # 只发布到宿主 loopback：/lab/** 是"能打死服务"的接口，绝不暴露公网。
+    # 映射到宿主 8081，避免和第一幕（宿主机直接跑，占 8080）撞端口。
+    # ---------------------------------------------------------------------
+    ports:
+      - "127.0.0.1:8081:8080"
+
+    volumes:
+      - ./logs:/lab/logs
+
+    # 演示「-Xmx 静默覆盖 25% 默认值」时，取消注释再 up：
+    #   预期 /lab/status 的 maxHeapMb 从 ~375 掉到 256
+    # environment:
+    #   JAVA_TOOL_OPTIONS: "-Xmx256m"
+
+    restart: "no"
